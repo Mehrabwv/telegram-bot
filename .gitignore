@@ -1,0 +1,27 @@
+# Private keys: copy config.example.py to config.py and fill it in
+config.py
+.env
+
+# The bot's own data: chat history, schedule state, learned weather accuracy
+memory_data/
+state.json
+weather_accuracy.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor settings
+.vscode/
+
+# PlatformIO build output
+.pio/
+
+# Python environment for building the case (see esp32-display/case/README.md)
+esp32-display/case/cadenv/
+
+# Weather experiment output
+weather_experiment/data/
+weather_experiment/*.log
