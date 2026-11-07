@@ -27,10 +27,15 @@ your computer and sends the brief to the display over Wi-Fi every 2 minutes.
 - **Right now** at all other times, refreshed every 30 minutes. After 9 PM the
   cards are for tomorrow.
 - The header turns **red ("bot offline")** if the bot hasn't sent anything for 10 minutes.
-- **Headlines:** the top 9 NYT headlines the bot collected (the same ones as its
-  hourly posts), 2 or 3 per page. Every 5 minutes they come up by themselves for
-  10 seconds a page, then the weather returns. Change this in `include/settings.h`
-  (`NEWS_EVERY_MINUTES`, 0 = only with the buttons).
+Other screens (button A steps through them):
+- **Headlines:** the top 9 NYT stories in the order the AI ranked them for you, each
+  marked MAJOR, IMPORTANT or TECH/SCI, 2 or 3 per page. Every 5 minutes they come up
+  by themselves for 10 seconds a page, then the weather returns (`NEWS_EVERY_MINUTES`
+  in `include/settings.h`, 0 = only with the buttons).
+- **Stocks:** your watchlist's prices and today's change (green up, red down).
+- **Later:** the next 12 hours, or tomorrow 7 AM–6 PM in the evening.
+- Open a headline or a stock for details: the story's summary, or the stock's previous
+  close, today's range and recent NYT stories about it.
 
 ## Wiring (already done)
 
@@ -98,16 +103,21 @@ the weather, and the bot prints `Display connected`.
 
 Two buttons can be wired to **D2** (A) and **D4** (B), each switch between its pin and GND:
 
-| Button | Short press |
-|---|---|
-| **A** | Next screen: weather → headlines page 1 → page 2 … → weather |
-| **B** | Back to the weather. On the weather: the status screen for 10 seconds (Wi-Fi signal, IP, last update from the bot) |
-| **The XIAO's B button** | Same as A, so it works before the case buttons are wired |
+Presses move around, holds do something:
 
-- **Hold both A and B (or the XIAO's B button) for 3 seconds:** Wi-Fi setup.
-- Headlines opened with a button stay until 60 seconds pass without a press.
+| | Press | Hold (0.6 s) |
+|---|---|---|
+| **A** | Next page / screen: weather → headlines (pages) → stocks → later → weather. With details open: back to the list | Open the highlighted headline or stock (details); hold again to close |
+| **B** | Highlight the next headline or stock (with details open: the next one's details). On the weather: the later forecast | Send the highlighted headline or stock to your phone. On the weather: the status screen |
+| **The XIAO's B button** | Same as A press | Same as A hold (3 s: Wi-Fi setup) |
+
+- **Hold A and B together for 3 seconds:** Wi-Fi setup.
+- **Send to your phone:** the display can't reach the bot, so the bot asks it every
+  10 seconds for anything waiting. Within about 10 seconds the story (with 👍/👎) or the
+  stock arrives on Telegram, and the screen says "Sent to your phone".
+- Any screen but the weather goes back to the weather after 60 seconds without a press.
 - From a browser on the same Wi-Fi: `http://weather-display.local/press?button=a`
-  (or `b`) acts like a press, and `/show-status` shows the status screen.
+  (or `b`, add `&hold=1` for a hold) acts like a press.
 
 If the laptop can't reach the display (the bot says "Display not reachable"), a VPN
 may be blocking your local network: allow LAN connections in it, or disconnect it.
@@ -122,8 +132,8 @@ list, wiring, assembly). Start with [case/README.md](case/README.md).
 
 - `include/settings.h`: pins, screen orientation and colors, names
 - `src/main.cpp`: Wi-Fi, the web server the bot talks to, the clock
-- `src/draw.cpp`: the screen layouts (weather, headlines) and the weather icons
+- `src/draw.cpp`: the screen layouts and the weather icons
 - `src/brief.cpp`: reads the brief the bot sends (JSON)
-- `src/headlines.cpp`: reads the headlines the bot sends (JSON)
+- `src/feeds.cpp`: reads the headlines and stock prices the bot sends (JSON)
 - `case/`: the 3D-printed case and dock (`build_case.py` makes the STL files)
 - The bot's side: `display.py` in the bot folder

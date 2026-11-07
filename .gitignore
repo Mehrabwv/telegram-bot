@@ -2,10 +2,15 @@
 config.py
 .env
 
-# The bot's own data: chat history, schedule state, learned weather accuracy
+# The bot's own data: chat history, schedule state, learned weather accuracy,
+# your news ratings
 memory_data/
 state.json
 weather_accuracy.json
+news_memory.json
+
+# The nightly GitHub upload's log
+scripts/nightly-push.log
 
 # Python
 __pycache__/

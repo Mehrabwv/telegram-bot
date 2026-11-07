@@ -35,6 +35,11 @@ struct Brief {
   int itemCount = 0;
   Hour hours[6];
   int hourCount = 0;
+  // The "later" screen: the next 12 hours (tomorrow in the evening)
+  String laterTitle;  // "Next 12 hours" or "Tomorrow"
+  String laterNote;   // "High 78° at 2 PM, low 55° at 6 AM, rain up to 10%"
+  Hour later[12];
+  int laterCount = 0;
   long utcOffset = DEFAULT_UTC_OFFSET;
   uint32_t sent = 0;  // when the bot sent it (Unix time), to set the clock
 };

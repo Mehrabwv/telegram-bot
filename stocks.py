@@ -114,11 +114,20 @@ async def fetch_quote(client, ticker):
         stamp = meta.get("regularMarketTime")
         regular = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
         now = datetime.now().timestamp()
+
+        def number(key):
+            value = meta.get(key)
+            return float(value) if isinstance(value, (int, float)) else None
+
         return {
             "price": price,
             "change": change,  # percent since the previous close
             "time": datetime.fromtimestamp(stamp) if isinstance(stamp, (int, float)) else None,
             "open": regular.get("start", 0) <= now < regular.get("end", 0),
+            "previous": number("chartPreviousClose") or number("previousClose"),
+            "high": number("regularMarketDayHigh"),  # today's range
+            "low": number("regularMarketDayLow"),
+            "name": meta.get("shortName") or meta.get("longName") or "",
         }
     return None
 

@@ -2,6 +2,14 @@
 
 #include <ArduinoJson.h>
 
+static void readHour(JsonObject hour, Hour& h) {
+  h.time = hour["time"] | "";
+  h.temp = hour["temp"] | 0;
+  h.rain = hour["rain"] | 0;
+  h.icon = hour["icon"] | "";
+  h.day = hour["day"] | true;
+}
+
 bool parseBrief(const String& json, Brief& out, String& error) {
   JsonDocument doc;
   DeserializationError problem = deserializeJson(doc, json);
@@ -52,12 +60,17 @@ bool parseBrief(const String& json, Brief& out, String& error) {
 
   for (JsonObject hour : doc["hours"].as<JsonArray>()) {
     if (b.hourCount >= 6) break;
-    Hour& h = b.hours[b.hourCount++];
-    h.time = hour["time"] | "";
-    h.temp = hour["temp"] | 0;
-    h.rain = hour["rain"] | 0;
-    h.icon = hour["icon"] | "";
-    h.day = hour["day"] | true;
+    readHour(hour, b.hours[b.hourCount++]);
+  }
+
+  JsonObject later = doc["later"];
+  if (!later.isNull()) {
+    b.laterTitle = later["title"] | "Later";
+    b.laterNote = later["note"] | "";
+    for (JsonObject hour : later["hours"].as<JsonArray>()) {
+      if (b.laterCount >= 12) break;
+      readHour(hour, b.later[b.laterCount++]);
+    }
   }
 
   b.ok = true;

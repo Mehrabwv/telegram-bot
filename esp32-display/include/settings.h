@@ -28,20 +28,27 @@
 #define PIN_BOOT_BUTTON 0  // the "B" button. Hold it 3 seconds to set up Wi-Fi again.
 
 // The two buttons on top of the case. Each switch goes between its pin and GND.
-//   A: next screen (weather -> headlines, page by page -> weather)
-//   B: back to the weather; on the weather, the status screen (Wi-Fi signal etc.)
-//   Hold both 3 seconds: Wi-Fi setup.
-// A short press of the XIAO's own B button works like A.
-#define PIN_BUTTON_A 3     // D2
-#define PIN_BUTTON_B 5     // D4
-#define STATUS_SECONDS 10  // how long the status screen stays up
+// Presses move around, holds do something:
+//   A press: next page / screen: weather -> headlines (pages) -> stocks -> later -> weather.
+//            With details open: back to the list
+//   B press: highlight the next headline or stock (with details open: the next one's).
+//            On the weather: the later forecast (and back)
+//   A hold:  open the highlighted headline or stock (more details); hold again to close
+//   B hold:  send the highlighted headline or stock to your phone (through the bot).
+//            On the weather screens: the status screen (Wi-Fi signal etc.)
+//   Hold A and B together for 3 seconds: Wi-Fi setup.
+// The XIAO's own B button: short = A press, longer = A hold, 3 seconds = Wi-Fi setup.
+#define PIN_BUTTON_A 3        // D2
+#define PIN_BUTTON_B 5        // D4
+#define HOLD_MS 600           // a press this long counts as a hold
+#define STATUS_SECONDS 10     // how long the status screen stays up
 
-// Headlines: shown by themselves every NEWS_EVERY_MINUTES (0 = only with the buttons),
-// NEWS_PAGE_SECONDS per page, then back to the weather. Opened with a button, they stay
-// until NEWS_IDLE_SECONDS pass without a press.
+// Headlines come up by themselves every NEWS_EVERY_MINUTES (0 = only with the
+// buttons), NEWS_PAGE_SECONDS a page, then the weather returns. Any other screen
+// goes back to the weather after IDLE_SECONDS without a press.
 #define NEWS_EVERY_MINUTES 5
 #define NEWS_PAGE_SECONDS 10
-#define NEWS_IDLE_SECONDS 60
+#define IDLE_SECONDS 60
 
 // The header turns red ("bot offline") when the bot hasn't sent anything for this long
 #define STALE_MINUTES 10

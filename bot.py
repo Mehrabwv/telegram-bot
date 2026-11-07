@@ -1,23 +1,27 @@
 import asyncio
+import html
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from telegram import Update, LinkPreviewOptions
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
+import curation
 import display
+import freebies
 from config import GROQ_API_KEY, GROQ_MODEL, MY_CHAT_ID, NYT_API_KEY, TELEGRAM_TOKEN
 from memory import (
     add_fact,
@@ -28,10 +32,12 @@ from memory import (
     load_history,
     remove_fact,
 )
-from news import format_news_message, get_news, latest_news, needs_download, pick_articles
-from stocks import WATCHLIST, format_stock_section, get_quotes, is_recent, stock_stories
+from news import get_news, latest_news, needs_download, section_label
+from stocks import WATCHLIST, format_stock_section, get_quotes, is_recent, price_text, stock_stories
 from weather import (
     HOME,
+    advice,
+    advice_lines,
     find_place,
     format_weather_brief,
     format_weather_report,
@@ -54,13 +60,26 @@ SEARCH_AVAILABLE = GROQ_MODEL in SEARCH_MODELS
 
 MAX_HISTORY = 20  # how many recent messages are sent to the AI
 
-NEWS_COUNT = 3  # top headlines per post
-NEWS_EVERY_MINUTES = 60  # news posts happen on the clock, e.g. 1:00, 2:00, 3:00
+# News: there is no hourly post. The NYT headlines are collected every 30 minutes
+# and the AI rates each new story (see curation.py). Only major breaking news is
+# sent right away; everything else waits for the next digest (below).
 COLLECT_EVERY_MINUTES = 30  # NYT headlines are collected (preprocessed) this often,
 COLLECT_MINUTES_EARLY = 5  # ...this long before each half hour: at :25 and :55
 NEWS_MAX_AGE_MINUTES = COLLECT_EVERY_MINUTES + 10  # /news downloads only if older
 STOCK_NEWS_COUNT = 3  # NYT stories in the stock section
-WEATHER_IN_HOURLY = False  # weather has its own updates now (below)
+SUMMARY_MAX_LENGTH = 220  # story summaries in messages are cut to this
+
+# Scheduled messages, besides the weather updates:
+# - the morning digest, right after the morning weather: new stories + stocks
+# - the stock check on weekdays, an hour before the New York market closes
+#   (1 PM in Arizona in winter, 12 PM in summer)
+# - the night summary: tomorrow's weather, the market close and the day's news.
+#   From then until you wake up, breaking news waits for the morning digest.
+STOCK_CHECK_MINUTES_BEFORE_CLOSE = 60
+NIGHT_SUMMARY_TIME = "22:00"
+DIGEST_LATE_MINUTES = 60  # a missed one (computer asleep) can still go out this late
+BIG_MOVE_PERCENT = 3  # the stock check points out moves at least this big
+DISPLAY_POLL_SECONDS = 10  # how often the bot asks the display for "send to my phone"
 
 # Weather updates: the morning one comes at your wake-up time (change it with /wake)
 MORNING_WEATHER_TIME = "08:00"  # used until you set a wake-up time with /wake
@@ -230,6 +249,7 @@ def load_state():
     state.setdefault("sent_urls", [])
     state.setdefault("sent_stock_urls", [])
     state.setdefault("weather_sent", {})  # e.g. {"morning": "2026-11-06"}
+    state.setdefault("digest_sent", {})  # e.g. {"night": "2026-11-06"}
     return state
 
 
@@ -371,60 +391,128 @@ async def answer_with_groq(
 # NEWS + STOCKS
 # =====================================
 
-async def send_news(bot, chat_id, message):
+async def send_news(bot, chat_id, message, keyboard=None):
     await bot.send_message(
         chat_id=chat_id,
         text=message,
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
+        reply_markup=keyboard,
     )
 
 
-async def build_briefing(hourly=False):
-    """Top headlines + stock section as one message, or None if there is no news.
+def reader_notes():
+    """What the bot knows about you (/remember), so the AI can judge what you'd like."""
+    return load_facts(MY_CHAT_ID) if MY_CHAT_ID else []
 
-    hourly=True (the hourly post): only stories that were not sent before are
-    used, and they are remembered. Otherwise (/news) the current best are shown.
-    """
-    # The hourly post uses the collection from :55; /news is fine with the last one
-    max_age_minutes = COLLECT_MINUTES_EARLY * 2 if hourly else NEWS_MAX_AGE_MINUTES
-    news = await get_news(max_age_minutes * 60)  # already collected, so instant
-    if not news["ranked"]:
-        return None
 
-    # Stories about the watchlist go in the stock section, not the top headlines
-    all_stock = stock_stories(news["all"])
-    stock_urls = {article["url"] for _, article in all_stock}
-    recent_stock = [(tickers, a) for tickers, a in all_stock if is_recent(a)]
+def short(text, limit):
+    """Cut text at a word, adding '…', if it is longer than limit."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "…"
 
-    if not hourly:
-        picks, _ = pick_articles(news["ranked"], set(), NEWS_COUNT, stock_urls)
-        stories = recent_stock[:STOCK_NEWS_COUNT]
-    else:
-        # Loaded right before it changes, so nothing else can change it in between
+
+def story_block(number, article, summary=True):
+    """One story: linked title, section and how important it is, summary."""
+    title = html.escape(article["title"])
+    url = html.escape(article["url"], quote=True)
+    lines = [f'{f"{number}. " if number else ""}<a href="{url}">{title}</a>',
+             f"<b>{html.escape(section_label(article['section']))}</b> · {curation.label(article)}"]
+    if summary and article.get("summary"):
+        lines.append(html.escape(short(article["summary"], SUMMARY_MAX_LENGTH)))
+    return "\n".join(lines)
+
+
+def format_stories(heading, articles, summaries=True):
+    return "\n\n".join([heading] + [story_block(n, a, summaries) for n, a in enumerate(articles, 1)])
+
+
+def rating_keyboard(articles):
+    """👍/👎 buttons for each story (two stories per row). They teach the bot your taste."""
+    if len(articles) == 1:
+        story_id = curation.article_id(articles[0]["url"])
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("👍 More like this", callback_data=f"r:{story_id}:1"),
+            InlineKeyboardButton("👎 Less like this", callback_data=f"r:{story_id}:-1"),
+        ]])
+    buttons = []
+    for number, article in enumerate(articles, 1):
+        story_id = curation.article_id(article["url"])
+        buttons += [
+            InlineKeyboardButton(f"{number} 👍", callback_data=f"r:{story_id}:1"),
+            InlineKeyboardButton(f"{number} 👎", callback_data=f"r:{story_id}:-1"),
+        ]
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def fresh_news():
+    """The collected headlines, with every story rated by the AI."""
+    news = await get_news(NEWS_MAX_AGE_MINUTES * 60)  # already collected, so instant
+    if news["ranked"]:
+        await curation.rate_stories(news["ranked"], reader_notes())
+    return news
+
+
+def stock_story_urls(news):
+    """Stories about the watchlist go in the stock section, not with the other news."""
+    return {article["url"] for _, article in stock_stories(news["all"])}
+
+
+async def news_digest(heading):
+    """(message, keyboard, stories) with 5-7 stories you haven't seen yet,
+    or (None, None, []) if there is nothing new."""
+    news = await fresh_news()
+    stories = curation.pick_digest(news["ranked"], stock_story_urls(news))
+    if not stories:
+        return None, None, []
+    return format_stories(heading, stories), rating_keyboard(stories), stories
+
+
+async def stock_section(new_stories_only=True):
+    """(Telegram HTML, quotes): prices plus NYT stories about the watchlist.
+    new_stories_only: leave out stock stories that were sent before (and remember these)."""
+    recent = [(t, a) for t, a in stock_stories(latest_news()["all"]) if is_recent(a)]
+    if new_stories_only:
         state = load_state()
-        picks, start_over = pick_articles(
-            news["ranked"], set(state["sent_urls"]), NEWS_COUNT, stock_urls
-        )
-        sent_stock = set(state["sent_stock_urls"])
-        stories = [(t, a) for t, a in recent_stock if a["url"] not in sent_stock]
-        stories = stories[:STOCK_NEWS_COUNT]
+        sent = set(state["sent_stock_urls"])
+        stories = [(t, a) for t, a in recent if a["url"] not in sent][:STOCK_NEWS_COUNT]
+        if stories:
+            state["sent_stock_urls"] = (state["sent_stock_urls"] + [a["url"] for _, a in stories])[-200:]
+            save_state(state)
+    else:
+        stories = recent[:STOCK_NEWS_COUNT]
+    quotes = await get_quotes()  # prices are always fetched fresh
+    return format_stock_section(quotes, stories), quotes
 
-        if start_over:
-            state["sent_urls"] = []
-        state["sent_urls"].extend(article["url"] for article in picks)
-        state["sent_urls"] = state["sent_urls"][-200:]
-        state["sent_stock_urls"].extend(article["url"] for _, article in stories)
-        state["sent_stock_urls"] = state["sent_stock_urls"][-200:]
+
+async def freebies_section(only_new=True):
+    """'🎁 Free to keep': games and apps that are free for a limited time (see freebies.py).
+    only_new: leave out ones already reported (and remember these). None if nothing."""
+    try:
+        found = await freebies.get_freebies()
+    except Exception as error:
+        print(f"Free games/apps failed: {type(error).__name__}")
+        return None
+    if not only_new:  # /free: all of them
+        return freebies.section(found, {}, max_games=len(found["games"]))[0]
+    text, keys = freebies.section(found, load_state().get("freebies_seen", {}))
+    if keys:
+        state = load_state()
+        state["freebies_seen"] = freebies.remember(state.get("freebies_seen", {}), keys)
         save_state(state)
+    return text
 
-    quotes = await get_quotes()  # prices and weather are always fetched fresh
-    message = format_news_message(picks) + "\n\n" + format_stock_section(quotes, stories)
-    if WEATHER_IN_HOURLY:
-        weather = await get_weather()
-        if weather:
-            message += "\n\n" + format_weather_brief(weather)
-    return message
+
+def big_moves(quotes):
+    """'⚡ Big moves: NVDA ▲ 4.21%' for stocks that moved BIG_MOVE_PERCENT or more."""
+    moved = [
+        f"<b>{ticker}</b> {price_text(quote).split(' ', 1)[-1]}"
+        for ticker, quote in quotes.items()
+        if quote and quote["change"] is not None and abs(quote["change"]) >= BIG_MOVE_PERCENT
+    ]
+    return f"\n\n⚡ <b>Big moves:</b> {', '.join(moved)}" if moved else ""
 
 
 async def build_stock_message():
@@ -437,16 +525,20 @@ async def build_stock_message():
 
 
 async def send_news_now(bot, chat_id):
-    """Send the current headlines and stocks to one chat (used by /news)."""
-    message = await build_briefing()
-    if message is None:
+    """/news: the best stories you haven't seen yet, plus stocks."""
+    message, keyboard, stories = await news_digest("📰 <b>New for you</b>")
+    if not latest_news()["ranked"]:
         await bot.send_message(
             chat_id=chat_id,
             text="Sorry, I couldn't get the news right now. Please try again later.",
         )
         return
-    await send_news(bot, chat_id, message)
-    print("News sent.")
+    if message is None:
+        message = "📰 Nothing new since your last update: you've seen all the top stories."
+    stocks_text, _ = await stock_section(new_stories_only=False)
+    await send_news(bot, chat_id, message + "\n\n" + stocks_text, keyboard)
+    curation.mark_sent(stories)
+    print(f"News sent ({len(stories)} new stories).")
 
 
 async def send_stocks_now(bot, chat_id):
@@ -455,38 +547,139 @@ async def send_stocks_now(bot, chat_id):
     print("Stocks sent.")
 
 
-async def send_to_subscribers(app: Application, subscribers, message, what):
+async def send_to_subscribers(app: Application, subscribers, message, what, keyboard=None):
     sent = 0
     for chat_id in subscribers:
         try:
-            await send_news(app.bot, chat_id, message)
+            await send_news(app.bot, chat_id, message, keyboard)
             sent += 1
         except TelegramError as error:
             print(f"Could not send {what} to a subscriber: {type(error).__name__}")
     print(f"Scheduled {what} sent to {sent} chat(s).")
 
 
-async def collect_news(max_age_minutes=0):
-    """Preprocess: download and rank the NYT headlines (about a minute).
+async def collect_news(app=None, max_age_minutes=0):
+    """Preprocess: download the NYT headlines (about a minute), have the AI rate
+    the new stories, and send breaking news if there is any (app given).
 
-    Skipped if they were already collected in the last max_age_minutes.
+    The download is skipped if the headlines were collected in the last max_age_minutes.
     """
     try:
-        await get_news(max_age_minutes * 60)
+        news = await get_news(max_age_minutes * 60)
+        if news["ranked"]:
+            await curation.rate_stories(news["ranked"], reader_notes())
+            if app is not None:
+                await send_alerts(app, news)
     except Exception as error:
         print(f"Collecting headlines failed: {type(error).__name__}")
 
 
-async def post_hourly_news(app: Application):
-    """Send the collected headlines + stocks to every subscriber."""
-    if not load_state()["subscribers"]:
-        return
+def is_quiet(state, moment):
+    """Between the night summary and your wake-up time, breaking news waits."""
+    now, night, wake = moment.strftime("%H:%M"), NIGHT_SUMMARY_TIME, morning_time(state)
+    if night > wake:
+        return now >= night or now < wake
+    return night <= now < wake
 
-    message = await build_briefing(hourly=True)
-    if message is None:
-        print("Scheduled news skipped: no articles available.")
+
+async def send_alerts(app: Application, news):
+    """Breaking news: only major stories the AI rated very urgent (usually none)."""
+    state = load_state()
+    if not state["subscribers"] or is_quiet(state, datetime.now()):
         return
-    await send_to_subscribers(app, load_state()["subscribers"], message, "news")
+    for article in curation.pick_alerts(news["ranked"], stock_story_urls(news)):
+        message = "🚨 <b>Breaking news</b>\n\n" + story_block(None, article)
+        curation.mark_sent([article], alert=True)  # first, so it can never go out twice
+        await send_to_subscribers(app, state["subscribers"], message, "breaking news",
+                                  rating_keyboard([article]))
+
+
+# =====================================
+# DIGESTS (morning, stock check, night)
+# =====================================
+
+def market_close(day):
+    """When the New York market closes (4 PM there) on `day`, in this computer's time."""
+    march = date(day.year, 3, 8)
+    dst_start = march + timedelta(days=(6 - march.weekday()) % 7)  # 2nd Sunday of March
+    november = date(day.year, 11, 1)
+    dst_end = november + timedelta(days=(6 - november.weekday()) % 7)  # 1st Sunday of November
+    new_york_utc = -4 if dst_start <= day < dst_end else -5
+    local_utc = datetime.now().astimezone().utcoffset()
+    return datetime.combine(day, datetime.min.time()) + timedelta(hours=16 - new_york_utc) + local_utc
+
+
+def at_time(day, hhmm):
+    return datetime.combine(day, datetime.strptime(hhmm, "%H:%M").time())
+
+
+def digests_due(state, moment):
+    """Which digests should go out now: 'morning', 'stocks' and/or 'night'.
+    Each goes out once a day, up to DIGEST_LATE_MINUTES late."""
+    today = moment.date()
+    times = {"night": at_time(today, NIGHT_SUMMARY_TIME)}
+    if state["weather_sent"].get("morning") == today.isoformat():
+        times["morning"] = at_time(today, morning_time(state))  # right after the morning weather
+    if today.weekday() < 5:
+        times["stocks"] = market_close(today) - timedelta(minutes=STOCK_CHECK_MINUTES_BEFORE_CLOSE)
+    late = timedelta(minutes=DIGEST_LATE_MINUTES)
+    return [
+        kind for kind, at in times.items()
+        if state["digest_sent"].get(kind) != today.isoformat() and at <= moment < at + late
+    ]
+
+
+def tomorrow_weather(weather):
+    """Tomorrow's high, low and rain, plus the jacket/cap/umbrella advice for it."""
+    lines = [format_weather_brief(weather)]  # in the evening it covers tomorrow
+    items, day = advice(weather)
+    if items and day == "tomorrow":
+        lines += [""] + advice_lines(items)
+    return "\n".join(lines)
+
+
+async def post_digest(app: Application, kind):
+    state = load_state()
+    today = datetime.now().date().isoformat()
+    if state["digest_sent"].get(kind) == today or not state["subscribers"]:
+        return
+    state["digest_sent"][kind] = today  # saved first, so it can never go out twice
+    save_state(state)
+
+    keyboard, stories = None, []
+    if kind == "stocks":
+        stocks_text, quotes = await stock_section()
+        close = nice_time(market_close(date.today()).strftime("%H:%M"))
+        message = f"📈 <b>Stock check:</b> the market closes at {close}\n\n{stocks_text}{big_moves(quotes)}"
+    else:
+        if kind == "morning":  # news first, then stocks
+            heading, nothing_new = "📰 <b>Your morning news</b>", "📰 No new stories since last night."
+            stocks_text, _ = await stock_section()
+            free_text = await freebies_section()
+            before, after = [], [stocks_text] + ([free_text] if free_text else [])
+        else:  # night: tomorrow's weather, the market close, then the news
+            heading = "📰 <b>Today's news you haven't seen</b>"
+            nothing_new = "📰 You've seen all of today's top stories."
+            before = ["🌙 <b>Good night!</b> Here's your summary."]
+            weather = await get_weather()
+            if weather:
+                before.append(tomorrow_weather(weather))
+            stocks_text, _ = await stock_section()
+            before, after = before + [stocks_text], []
+        news = await fresh_news()
+        stories = curation.pick_digest(news["ranked"], stock_story_urls(news))
+        keyboard = rating_keyboard(stories) if stories else None
+
+        def compose(summaries):
+            news_part = format_stories(heading, stories, summaries) if stories else nothing_new
+            return "\n\n".join(before + [news_part] + after)
+
+        message = compose(True)
+        if len(message) > 4000:  # Telegram's limit is 4096 characters
+            message = compose(False)
+
+    await send_to_subscribers(app, state["subscribers"], message, f"{kind} digest", keyboard)
+    curation.mark_sent(stories)
 
 
 # =====================================
@@ -563,12 +756,12 @@ async def sleep_until(moment):
         await asyncio.sleep(seconds)
 
 
-async def run_posts(app: Application, weather_kinds, news_due):
-    """Weather first (the morning one is your wake-up message), then the news."""
+async def run_posts(app: Application, weather_kinds, digest_kinds):
+    """Weather first (the morning one is your wake-up message), then the digests."""
     for kind in weather_kinds:
         await post_weather_update(app, kind)
-    if news_due:
-        await post_hourly_news(app)
+    for kind in digest_kinds:
+        await post_digest(app, kind)
 
 
 async def check_weather_accuracy():
@@ -582,14 +775,15 @@ def start_due_jobs(app: Application, moment):
     """Start everything that is due at this minute."""
     minute_of_day = moment.hour * 60 + moment.minute
     if (minute_of_day + COLLECT_MINUTES_EARLY) % COLLECT_EVERY_MINUTES == 0:
-        start_background(collect_news(max_age_minutes=COLLECT_MINUTES_EARLY * 2))
+        start_background(collect_news(app, max_age_minutes=COLLECT_MINUTES_EARLY * 2))
     if moment.minute == ACCURACY_CHECK_MINUTE:
         start_background(check_weather_accuracy())
 
-    weather_kinds = weather_updates_due(load_state(), moment)
-    news_due = minute_of_day % NEWS_EVERY_MINUTES == 0
-    if weather_kinds or news_due:
-        start_background(run_posts(app, weather_kinds, news_due))
+    state = load_state()
+    weather_kinds = weather_updates_due(state, moment)
+    digest_kinds = digests_due(state, moment)
+    if weather_kinds or digest_kinds:
+        start_background(run_posts(app, weather_kinds, digest_kinds))
     # The weather display (a new morning/afternoon update sends it the brief itself)
     if minute_of_day % display.SEND_EVERY_MINUTES == 0 and not weather_kinds:
         start_background(update_display())
@@ -597,13 +791,15 @@ def start_due_jobs(app: Application, moment):
 
 async def clock_loop(app: Application):
     """The schedule. Once a minute, on the minute, it starts whatever is due:
-    - collect the NYT headlines every 30 minutes (at :25 and :55)
-    - post headlines + stocks every hour (at :00)
-    - weather updates at your wake-up time (8:00 AM for now) and at 1:00 PM
+    - collect the NYT headlines every 30 minutes (at :25 and :55), have the AI
+      rate the new stories, and send breaking news if there is any
+    - weather updates at your wake-up time and at 1:00 PM
+    - the morning digest after the morning weather, the stock check an hour
+      before the market closes (weekdays), and the night summary at 10 PM
     - check the weather sources' accuracy every hour (at :05)
     - send the weather display its brief every 2 minutes
     """
-    start_background(collect_news())  # right away, so /news works from the start
+    start_background(collect_news(app))  # right away, so /news works from the start
     start_background(update_display())
     tick = datetime.now().replace(second=0, microsecond=0) + timedelta(minutes=1)
     while True:
@@ -656,12 +852,86 @@ async def answer_weather(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
     )
 
 
+async def display_request_loop(app: Application):
+    """'Send to my phone' (hold B on the display): the display can't reach the bot,
+    so the bot asks it for new requests every few seconds."""
+    while True:
+        await asyncio.sleep(DISPLAY_POLL_SECONDS)
+        for request in await display.pending_requests():
+            try:
+                await send_display_request(app, request)
+            except Exception as error:
+                print(f"Sending a display request failed: {type(error).__name__}")
+
+
+async def send_display_request(app: Application, request):
+    state = load_state()
+    chat_id = MY_CHAT_ID or (state["subscribers"] or [None])[0]
+    if not chat_id or not isinstance(request, dict):
+        return
+    kind, item = request.get("type"), str(request.get("id", ""))
+    if kind == "headline":
+        story = curation.article_by_id(item)
+        if story is None:
+            return
+        await send_news(app.bot, chat_id, "📌 <b>From your display</b>\n\n" + story_block(None, story),
+                        rating_keyboard([story]))
+        print(f"Display: sent a story to the phone: {story['title']}")
+    elif kind == "stock":
+        quotes = await get_quotes()
+        stories = [(t, a) for t, a in stock_stories(latest_news()["all"]) if item in t and is_recent(a)]
+        lines = [f"📌 <b>{html.escape(item)}</b> from your display: {price_text(quotes.get(item))}"]
+        quote = quotes.get(item)
+        if quote and quote.get("previous") and quote.get("low") and quote.get("high"):
+            lines.append(f"Previous close ${quote['previous']:,.2f}, "
+                         f"today ${quote['low']:,.2f} - ${quote['high']:,.2f}")
+        for _, article in stories[:STOCK_NEWS_COUNT]:
+            url = html.escape(article["url"], quote=True)
+            lines.append(f'• <a href="{url}">{html.escape(article["title"])}</a>')
+        await send_news(app.bot, chat_id, "\n".join(lines))
+        print(f"Display: sent {item} to the phone")
+
+
+async def rate_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A 👍/👎 under a story: saved, and shown with a ✓ on the button."""
+    query = update.callback_query
+    try:
+        _, story_id, value = query.data.split(":")
+        rating = 1 if value == "1" else -1
+    except (AttributeError, ValueError):
+        await query.answer()
+        return
+    title = curation.record_rating(story_id, rating)
+    if title is None:
+        await query.answer("That story is too old to rate now.")
+        return
+    await query.answer(("👍 More like this: " if rating > 0 else "👎 Less like this: ") + short(title, 150))
+    rows = []
+    for row in query.message.reply_markup.inline_keyboard if query.message.reply_markup else []:
+        new_row = []
+        for button in row:
+            text = button.text
+            parts = (button.callback_data or "").split(":")
+            if len(parts) == 3 and parts[1] == story_id:  # this story's two buttons
+                text = text.replace(" ✓", "") + (" ✓" if parts[2] == value else "")
+            new_row.append(InlineKeyboardButton(text, callback_data=button.callback_data))
+        rows.append(new_row)
+    if rows:
+        try:
+            await query.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+        except TelegramError:
+            pass  # e.g. the same button pressed twice: nothing to change
+    print(f"News rated {'up' if rating > 0 else 'down'}: {title}")
+
+
 async def post_init(app: Application):
     app.bot_data["clock_task"] = asyncio.create_task(clock_loop(app))
+    app.bot_data["display_task"] = asyncio.create_task(display_request_loop(app))
 
 
 async def post_shutdown(app: Application):
-    tasks = [task for task in (app.bot_data.get("clock_task"), *_background_tasks) if task]
+    tasks = [task for task in (app.bot_data.get("clock_task"), app.bot_data.get("display_task"),
+                               *_background_tasks) if task]
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -680,14 +950,16 @@ HELP_TEXT = (
     "/forget number - Delete a saved fact\n"
     "/memory - Show what I remember\n"
     "/search question - Search the web for a live answer\n"
-    f"/subscribe - Get {NEWS_COUNT} NYT headlines + your stocks every hour, and weather "
-    "updates when you wake up and at 1 PM\n"
+    "/subscribe - Breaking news when it happens; weather and a news digest when you "
+    "wake up; weather and a stock check in the afternoon; a summary at 10 PM\n"
     "/unsubscribe - Stop the scheduled messages\n"
-    "/news - Headlines and stocks right now (or just say \"check the news\")\n"
+    "/news - New stories you haven't seen, and stocks (or just say \"check the news\")\n"
     f"/stocks - Prices and NYT stories for {WATCHLIST_TEXT} "
     "(or say \"check my stocks\")\n"
+    "/free - Games and apps that are free to keep right now (Steam, Epic, GOG, Android)\n"
     f"/weather city - Weather and forecast (no city = {HOME['name']})\n"
     "/wake 7:30 - Set your wake-up time for the morning weather update\n\n"
+    "Rate stories with the 👍/👎 buttons under them: I learn what you like.\n\n"
     "You can also send me any text question. Weather questions like \"will it "
     "rain tomorrow?\" are answered from live weather data; for other recent "
     "things I may search the web on my own."
@@ -789,10 +1061,13 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["subscribers"].append(chat_id)
         save_state(state)
     await update.message.reply_text(
-        f"Subscribed! You'll get {NEWS_COUNT} New York Times headlines and a stock "
-        f"section ({WATCHLIST_TEXT}) every {NEWS_EVERY_MINUTES} minutes on the hour, "
-        f"plus weather updates at {nice_time(morning_time(state))} and "
-        f"{nice_time(AFTERNOON_WEATHER_TIME)}. Send /unsubscribe to stop."
+        f"Subscribed! At {nice_time(morning_time(state))} (your wake-up time): the weather, "
+        f"the news you missed and any new free games or apps. At {nice_time(AFTERNOON_WEATHER_TIME)}: "
+        "the weather. "
+        f"On weekdays, an hour before the market closes: your stocks ({WATCHLIST_TEXT}). "
+        f"At {nice_time(NIGHT_SUMMARY_TIME)}: tomorrow's weather, the market close and "
+        "today's news. Breaking news comes when it happens (not at night). "
+        "Send /unsubscribe to stop."
     )
     print("A chat subscribed to news.")
 
@@ -818,6 +1093,13 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     # Run in the background so the bot keeps answering other messages
     context.application.create_task(send_news_now(context.bot, update.effective_chat.id))
+
+
+async def free_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/free: every game and app that is free to keep right now."""
+    text = await freebies_section(only_new=False)
+    await send_news(context.bot, update.effective_chat.id,
+                    text or "🎁 Nothing is free to keep right now. I'll tell you in the morning when something is.")
 
 
 async def stocks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -930,8 +1212,10 @@ def main():
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler("stocks", stocks))
+    app.add_handler(CommandHandler("free", free_command))
     app.add_handler(CommandHandler("weather", weather_command))
     app.add_handler(CommandHandler("wake", wake_command))
+    app.add_handler(CallbackQueryHandler(rate_button, pattern=r"^r:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("=" * 40)
@@ -943,9 +1227,11 @@ def main():
         print("Web search: ON (Groq browser_search)")
     else:
         print("Web search: OFF (needs openai/gpt-oss-20b or openai/gpt-oss-120b)")
+    liked, disliked = curation.rating_counts()
     print(
-        f"News: {NEWS_COUNT} NYT articles every {NEWS_EVERY_MINUTES} minutes, "
-        f"collected every {COLLECT_EVERY_MINUTES} minutes"
+        f"News: collected every {COLLECT_EVERY_MINUTES} minutes and rated by the AI; "
+        f"breaking news right away, digests at wake-up and {nice_time(NIGHT_SUMMARY_TIME)} "
+        f"(your ratings so far: {liked} liked, {disliked} disliked)"
     )
     print(f"Stocks: {WATCHLIST_TEXT}")
     print(

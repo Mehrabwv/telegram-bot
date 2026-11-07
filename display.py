@@ -11,8 +11,13 @@ What it shows:
 Each brief: now (temperature, feels like, conditions, high/low), jacket / cap /
 umbrella (a colored card = bring it), and the next BRIEF_HOURS hours.
 
-It also gets the top NEWS_ON_DISPLAY NYT headlines (the ones the bot already
-collected), for its headlines screen.
+It also gets, for its other screens:
+- the top NEWS_ON_DISPLAY headlines, in the order the AI ranked them for you
+  (curation.py), with their summaries,
+- the watchlist's prices (refreshed every STOCKS_EVERY_MINUTES),
+- the next 12 hours (tomorrow after 6 PM), inside the brief.
+Holding B on the display queues "send this to my phone"; the bot collects those
+requests with pending_requests().
 """
 
 import asyncio
@@ -24,13 +29,16 @@ from datetime import datetime, timedelta
 
 import httpx
 
+import curation
 from news import latest_news, section_label
+from stocks import WATCHLIST, get_quotes, is_recent, stock_stories
 from weather import (
     advice_facts,
     clock,
     compare_sources,
     get_weather,
     hour,
+    hours_between,
     rest_of_day,
     tonight_low,
     uv_level,
@@ -46,6 +54,9 @@ BRIEF_HOURS = 5  # the next hours shown, and how long a morning/afternoon brief 
 LIVE_EVERY_MINUTES = 30  # between briefs, "Right now" is rebuilt this often
 TIMEOUT_SECONDS = 5
 NEWS_ON_DISPLAY = 9  # headlines sent to the display (it shows them a few per page)
+SUMMARY_ON_DISPLAY = 240  # characters of each story's summary (its detail view)
+STOCKS_EVERY_MINUTES = 10  # how often the display's stock prices are refreshed
+LATER_HOURS = 12  # the "later" screen: the next 12 hours, or tomorrow 7 AM-6 PM
 
 TITLES = {"morning": "Morning brief", "afternoon": "Afternoon brief", "now": "Right now"}
 
@@ -81,6 +92,8 @@ _live_built = None  # ...and when it was built
 _online = None  # was the display reachable last time? (None = not tried yet)
 _last_ip = None  # its address the last time it worked
 _shown_id = None
+_stocks = None  # the stock screen, as last built
+_stocks_built = None
 
 
 # =====================================
@@ -215,6 +228,7 @@ def build_brief(weather, kind, made=None):
         "confidence": comparison["level"] if comparison else "",
         "items": items,
         "hours": hours,
+        "later": later_forecast(weather),
         "utc_offset": weather.get("utc_offset_seconds") or 0,
     }
 
@@ -225,14 +239,27 @@ def plain_text(text):
     return " ".join(text.encode("ascii", "ignore").decode().split())
 
 
+def cut(text, limit):
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip(",;:") + "..."
+
+
 def build_headlines():
-    """The headlines screen, as a JSON-ready dict, or None if none are collected yet."""
+    """The headlines screen, as a JSON-ready dict, or None if none are collected yet.
+    The stories come in the order the AI ranked them for you."""
     news = latest_news()
     if news["time"] is None or not news["ranked"]:
         return None
     items = [
-        {"title": plain_text(article["title"]), "section": plain_text(section_label(article["section"]))}
-        for article in news["ranked"][:NEWS_ON_DISPLAY]
+        {
+            "id": curation.article_id(article["url"]),
+            "title": plain_text(article["title"]),
+            "section": plain_text(section_label(article["section"])),
+            "summary": cut(plain_text(article["summary"]), SUMMARY_ON_DISPLAY),
+            "tag": curation.screen_tag(article),
+        }
+        for article in curation.best(news["ranked"], NEWS_ON_DISPLAY)
     ]
     return {
         "v": 1,
@@ -240,6 +267,71 @@ def build_headlines():
         "made": clock(news["time"].isoformat(timespec="minutes")),
         "items": [item for item in items if item["title"]],
     }
+
+
+def money(value):
+    return f"${value:,.2f}" if isinstance(value, (int, float)) else ""
+
+
+def build_stocks(quotes):
+    """The stock screen: price, change and today's range for each watchlist stock."""
+    stories = [(t, a) for t, a in stock_stories(latest_news()["all"]) if is_recent(a)]
+    items = []
+    for ticker, names in WATCHLIST:
+        quote = quotes.get(ticker)
+        if quote is None:
+            continue
+        change = quote["change"]
+        low, high = quote.get("low"), quote.get("high")
+        items.append({
+            "ticker": ticker,
+            "name": cut(plain_text(quote.get("name") or (names[0] if names else ticker)), 30),
+            "price": money(quote["price"]),
+            "change": round(change, 2) if change is not None else 0,
+            "change_text": f"{change:+.2f}%" if change is not None else "",
+            "prev": money(quote.get("previous")),
+            "range": f"{money(low)} - {money(high)}" if low and high else "",
+            "news": [plain_text(a["title"]) for t, a in stories if ticker in t][:2],
+        })
+    if not items:
+        return None
+    times = [q["time"] for q in quotes.values() if q and q["time"]]
+    made = max(times) if times else datetime.now()
+    is_open = any(q and q["open"] for q in quotes.values())
+    return {
+        "v": 1,
+        "id": made.isoformat(timespec="minutes"),
+        "made": clock(made.isoformat(timespec="minutes")),
+        "market": "Open" if is_open else "Closed",
+        "items": items,
+    }
+
+
+def later_forecast(weather):
+    """The "later" screen: the next 12 hours, or tomorrow 7 AM-6 PM after 6 PM."""
+    now = datetime.fromisoformat(weather["current"]["time"]).replace(minute=0)
+    if now.hour >= 18:
+        day = now + timedelta(days=1)
+        start, title = day.replace(hour=7), "Tomorrow"
+    else:
+        start, title = now + timedelta(hours=1), f"Next {LATER_HOURS} hours"
+    rows = [r for r in hours_between(weather, start, start + timedelta(hours=LATER_HOURS - 1))
+            if r.get("temperature_2m") is not None]
+    if not rows:
+        return None
+    hours = [{
+        "time": hour(r["time"]),
+        "temp": round(r["temperature_2m"]),
+        "rain": round(r.get("precipitation_probability") or 0),
+        "icon": icon_for_code(r.get("weather_code")),
+        "day": is_daytime(weather, r["time"]),
+    } for r in rows]
+    warmest = max(rows, key=lambda r: r["temperature_2m"])
+    coldest = min(rows, key=lambda r: r["temperature_2m"])
+    rain = max(h["rain"] for h in hours)
+    note = (f"High {round(warmest['temperature_2m'])}° at {hour(warmest['time'])}, "
+            f"low {round(coldest['temperature_2m'])}° at {hour(coldest['time'])}, rain up to {rain}%")
+    return {"title": title, "note": note, "hours": hours}
 
 
 def brief_is_current(brief, now):
@@ -298,16 +390,38 @@ def went_offline(reason):
     _online = False
 
 
-async def send_headlines(client, ip):
-    """The headlines, for the display's headlines screen. Not essential: a display
-    with older firmware (no /news) or a failed send is skipped quietly."""
-    headlines = build_headlines()
-    if headlines is None:
-        return
+async def send_extras(client, ip):
+    """The headlines and stock screens. Not essential: a display with older
+    firmware (no /news or /stocks) or a failed send is skipped quietly."""
+    global _stocks, _stocks_built
+    now = datetime.now()
+    if _stocks_built is None or now - _stocks_built >= timedelta(minutes=STOCKS_EVERY_MINUTES):
+        _stocks, _stocks_built = build_stocks(await get_quotes()), now
+    for path, payload in (("news", build_headlines()), ("stocks", _stocks)):
+        if payload is None:
+            continue
+        try:
+            await client.post(f"http://{ip}:{DISPLAY_PORT}/{path}", json=payload)
+        except httpx.HTTPError:
+            pass
+
+
+async def pending_requests():
+    """'Send to my phone' requests from the display (hold B), as a list of
+    {"type": "headline" or "stock", "id": ...}. Empty if there are none or the
+    display can't be reached."""
+    if _online is not True or _last_ip is None:
+        return []
     try:
-        await client.post(f"http://{ip}:{DISPLAY_PORT}/news", json=headlines)
-    except httpx.HTTPError:
-        pass
+        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+            response = await client.get(f"http://{_last_ip}:{DISPLAY_PORT}/requests")
+        if response.status_code == 404:
+            return []  # older firmware
+        response.raise_for_status()
+        requests = response.json()
+    except (httpx.HTTPError, ValueError):
+        return []
+    return requests if isinstance(requests, list) else []
 
 
 async def update(stored_brief):
@@ -338,7 +452,7 @@ async def update(stored_brief):
             except httpx.HTTPError as error:
                 went_offline(type(error).__name__)
                 return
-            await send_headlines(client, ip)
+            await send_extras(client, ip)
         if _online is not True:
             print(f"Display connected: {DISPLAY_HOST} ({ip})")
         _online, _last_ip = True, ip

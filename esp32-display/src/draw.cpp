@@ -30,6 +30,10 @@ const uint32_t GOOD = 0x22C55Eu;
 const uint32_t SO_SO = 0xF59E0Bu;
 const uint32_t BAD = 0xEF4444u;
 const uint32_t ITEM_COLORS[3] = {0xF97316u, 0xFACC15u, 0x60A5FAu};  // jacket, cap, umbrella
+const uint32_t SELECT_BG = 0x1C2E4Au;    // the highlighted headline or stock
+const uint32_t SELECT_EDGE = 0x60A5FAu;
+const uint32_t TOAST_BG = 0x334155u;
+const uint32_t TECH_SCI = 0xA78BFAu;
 
 const int W = 320;
 const char DEGREE[] = "\xC2\xB0";  // "°" in UTF-8: drawn as a small ring (the fonts lack it)
@@ -175,6 +179,41 @@ uint32_t confidenceColor(const String& level) {
   return BAD;
 }
 
+// The AI's rating of a story, as a colored word
+uint32_t tagColor(const String& tag) {
+  if (tag == "MAJOR") return BAD;
+  if (tag == "IMPORTANT") return SO_SO;
+  return TECH_SCI;
+}
+
+// Up green, down red
+uint32_t changeColor(float change) { return change > 0 ? GOOD : change < 0 ? BAD : DIM; }
+
+// A panel of up to 6 hours: time, icon, temperature, chance of rain
+void hourPanel(lgfx::LovyanGFX& g, const Hour* hours, int count, int panelY) {
+  if (count <= 0) return;
+  int panelX = 6, panelW = W - 12, panelH = 69;
+  g.fillRoundRect(panelX, panelY, panelW, panelH, 8, PANEL);
+  float columnW = (float)panelW / max(count, 5);
+  for (int i = 0; i < count; i++) {
+    const Hour& h = hours[i];
+    int cx = panelX + columnW * (i + 0.5f);
+    g.setFont(&fonts::Font2);
+    drawCentered(g, h.time, cx, panelY + 2, DIM);
+    drawIcon(g, h.icon, h.day, cx, panelY + 29, 24, PANEL);
+    g.setFont(&fonts::FreeSansBold9pt7b);
+    drawCentered(g, tempText(h.temp), cx, panelY + 40, TEXT);
+    g.setFont(&fonts::Font2);
+    drawCentered(g, String(h.rain) + "%", cx, panelY + 53, h.rain >= 20 ? RAIN : FAINT);
+  }
+}
+
+// "B: back   Hold B: send to phone" along the bottom of a detail screen
+void drawHint(lgfx::LovyanGFX& g, const String& text) {
+  g.setFont(&fonts::Font2);
+  drawText(g, text, 8, 223, FAINT);
+}
+
 // The header bar: title, a dim subtitle, and the clock on the right
 void drawHeader(lgfx::LovyanGFX& g, const String& title, const String& subtitle,
                 const String& clock, bool stale) {
@@ -252,8 +291,18 @@ int headlinePages(lgfx::LovyanGFX& g, const Headlines& h) {
   return max(1, layoutHeadlines(g, h, starts, MAX_HEADLINES));
 }
 
-void drawHeadlines(lgfx::LovyanGFX& g, const Headlines& h, int page, const String& clock,
-                   bool stale) {
+void headlinePage(lgfx::LovyanGFX& g, const Headlines& h, int page, int& first, int& last) {
+  first = last = 0;
+  if (!h.ok) return;
+  int starts[MAX_HEADLINES];
+  int pages = max(1, layoutHeadlines(g, h, starts, MAX_HEADLINES));
+  page = constrain(page, 0, pages - 1);
+  first = starts[page];
+  last = page + 1 < pages ? starts[page + 1] : h.count;
+}
+
+void drawHeadlines(lgfx::LovyanGFX& g, const Headlines& h, int page, int selected,
+                   const String& clock, bool stale) {
   g.fillScreen(BG);
   if (!h.ok) {
     drawHeader(g, "Headlines", "", clock, stale);
@@ -264,10 +313,10 @@ void drawHeadlines(lgfx::LovyanGFX& g, const Headlines& h, int page, const Strin
     drawText(g, "If this stays, restart the bot.", 10, 88, DIM);
     return;
   }
-  int starts[MAX_HEADLINES];
-  int pages = max(1, layoutHeadlines(g, h, starts, MAX_HEADLINES));
+  int pages = headlinePages(g, h);
   page = constrain(page, 0, pages - 1);
-  int first = starts[page], last = page + 1 < pages ? starts[page + 1] : h.count;
+  int first, last;
+  headlinePage(g, h, page, first, last);
 
   // "1/3  9:25 PM": the page, then when the bot collected them (cut first if short of room)
   String subtitle = pages > 1 ? String(page + 1) + "/" + String(pages) : "";
@@ -277,17 +326,148 @@ void drawHeadlines(lgfx::LovyanGFX& g, const Headlines& h, int page, const Strin
   int y = NEWS_TOP;
   String lines[NEWS_MAX_LINES];
   for (int i = first; i < last; i++) {
-    if (i > first) g.drawFastHLine(8, y - NEWS_GAP / 2 - 1, W - 16, DIVIDER);
-    String section = String(i + 1) + "  " + h.items[i].section;
+    const Headline& item = h.items[i];
+    int count = headlineLines(g, item, lines);
+    int height = NEWS_SECTION_H + count * NEWS_LINE_H;
+    if (i == selected) {
+      g.fillRoundRect(3, y - 4, W - 6, height + 7, 6, SELECT_BG);
+      g.drawRoundRect(3, y - 4, W - 6, height + 7, 6, SELECT_EDGE);
+    } else if (i > first && i - 1 != selected) {
+      g.drawFastHLine(8, y - NEWS_GAP / 2 - 1, W - 16, DIVIDER);
+    }
+    String section = String(i + 1) + "  " + item.section;
     section.toUpperCase();
     g.setFont(&fonts::Font2);
-    drawText(g, fit(g, section, NEWS_TEXT_W), 8, y, SECTION_COLOR);
-    int count = headlineLines(g, h.items[i], lines);  // sets the title font
+    int x = 8 + drawText(g, fit(g, section, NEWS_TEXT_W - 90), 8, y, SECTION_COLOR) + 10;
+    if (item.tag.length()) drawText(g, item.tag, x, y, tagColor(item.tag));
+    g.setFont(&fonts::FreeSans9pt7b);
     for (int l = 0; l < count; l++) {
       drawText(g, lines[l], 8, y + NEWS_SECTION_H + l * NEWS_LINE_H, TEXT);
     }
-    y += NEWS_SECTION_H + count * NEWS_LINE_H + NEWS_GAP;
+    y += height + NEWS_GAP;
   }
+}
+
+void drawHeadlineDetail(lgfx::LovyanGFX& g, const Headlines& h, int index, const String& clock,
+                        bool stale) {
+  g.fillScreen(BG);
+  index = constrain(index, 0, max(0, h.count - 1));
+  const Headline& item = h.items[index];
+  drawHeader(g, "Story " + String(index + 1) + "/" + String(h.count), h.made, clock, stale);
+
+  int y = 30;
+  String section = item.section;
+  section.toUpperCase();
+  g.setFont(&fonts::Font2);
+  int x = 8 + drawText(g, fit(g, section, 180), 8, y, SECTION_COLOR) + 10;
+  if (item.tag.length()) drawText(g, item.tag, x, y, tagColor(item.tag));
+  y += 19;
+
+  String lines[8];
+  g.setFont(&fonts::FreeSansBold9pt7b);
+  int count = wrapText(g, item.title, W - 16, 4, lines);
+  for (int l = 0; l < count; l++) drawText(g, lines[l], 8, y + l * 20, TEXT);
+  y += count * 20 + 6;
+
+  if (item.summary.length()) {
+    g.setFont(&fonts::FreeSans9pt7b);
+    int room = (218 - y) / 19;
+    count = wrapText(g, item.summary, W - 16, constrain(room, 0, 8), lines);
+    for (int l = 0; l < count; l++) drawText(g, lines[l], 8, y + l * 19, DIM);
+  }
+  drawHint(g, "A: back    B: next    Hold B: send to phone");
+}
+
+void drawStocks(lgfx::LovyanGFX& g, const Stocks& s, int selected, const String& clock, bool stale) {
+  g.fillScreen(BG);
+  drawHeader(g, "Stocks", s.ok ? s.market + ", " + s.made : String(""), clock, stale);
+  if (!s.ok) {
+    g.setFont(&fonts::FreeSansBold9pt7b);
+    drawText(g, "No prices yet", 10, 40, TEXT);
+    g.setFont(&fonts::FreeSans9pt7b);
+    drawText(g, "The bot sends them with the weather.", 10, 66, DIM);
+    return;
+  }
+  const int top = 28, rowH = 42;
+  for (int i = 0; i < s.count; i++) {
+    const Stock& st = s.items[i];
+    int y = top + i * rowH;
+    if (i == selected) {
+      g.fillRoundRect(3, y + 1, W - 6, rowH - 2, 6, SELECT_BG);
+      g.drawRoundRect(3, y + 1, W - 6, rowH - 2, 6, SELECT_EDGE);
+    } else if (i > 0 && i - 1 != selected) {
+      g.drawFastHLine(8, y, W - 16, DIVIDER);
+    }
+    g.setFont(&fonts::FreeSansBold9pt7b);
+    drawText(g, st.ticker, 12, y + 4, TEXT);
+    drawRight(g, st.price, W - 12, y + 4, TEXT);
+    g.setFont(&fonts::Font2);
+    int pillW = st.changeText.length() ? textWidth(g, st.changeText) + 12 : 0;
+    drawText(g, fit(g, st.name, W - 36 - pillW), 12, y + 23, DIM);
+    if (pillW) {
+      g.fillRoundRect(W - 12 - pillW, y + 22, pillW, 17, 4, changeColor(st.change));
+      drawText(g, st.changeText, W - 12 - pillW + 6, y + 22, DARK_TEXT);
+    }
+  }
+}
+
+void drawStockDetail(lgfx::LovyanGFX& g, const Stocks& s, int index, const String& clock,
+                     bool stale) {
+  g.fillScreen(BG);
+  index = constrain(index, 0, max(0, s.count - 1));
+  const Stock& st = s.items[index];
+  drawHeader(g, st.ticker, st.name, clock, stale);
+
+  g.setFont(st.price.length() > 8 ? &fonts::FreeSansBold18pt7b : &fonts::FreeSansBold24pt7b);
+  int priceW = drawText(g, st.price, 8, 32, TEXT);
+  g.setFont(&fonts::FreeSansBold12pt7b);
+  drawText(g, st.changeText, 8 + priceW + 12, 44, changeColor(st.change));
+
+  int y = 84;
+  g.setFont(&fonts::FreeSans9pt7b);
+  if (st.prev.length()) {
+    drawText(g, "Previous close", 8, y, DIM);
+    drawRight(g, st.prev, W - 8, y, TEXT);
+    y += 22;
+  }
+  if (st.range.length()) {
+    drawText(g, "Today", 8, y, DIM);
+    drawRight(g, st.range, W - 8, y, TEXT);
+    y += 22;
+  }
+  drawText(g, s.market + ", " + s.made, 8, y, FAINT);
+  y += 26;
+
+  String lines[2];
+  for (int n = 0; n < st.newsCount && y < 200; n++) {
+    g.setFont(&fonts::Font2);
+    int count = wrapText(g, st.news[n], W - 24, 2, lines);
+    g.fillCircle(11, y + 8, 2, SECTION_COLOR);
+    for (int l = 0; l < count; l++) drawText(g, lines[l], 18, y + l * 16, TEXT);
+    y += count * 16 + 6;
+  }
+  drawHint(g, "A: back    B: next    Hold B: send to phone");
+}
+
+void drawLater(lgfx::LovyanGFX& g, const Brief& b, const String& clock, bool stale) {
+  g.fillScreen(BG);
+  drawHeader(g, b.laterTitle, "", clock, stale);
+  int firstRow = min(6, b.laterCount);
+  hourPanel(g, b.later, firstRow, 30);
+  hourPanel(g, b.later + firstRow, b.laterCount - firstRow, 104);
+  g.setFont(&fonts::FreeSans9pt7b);
+  String lines[2];
+  int count = wrapText(g, b.laterNote, W - 16, 2, lines);
+  for (int l = 0; l < count; l++) drawText(g, lines[l], 8, 182 + l * 22, DIM);
+}
+
+void drawToast(lgfx::LovyanGFX& g, const String& text) {
+  g.setFont(&fonts::FreeSans9pt7b);
+  int w = min(W - 16, textWidth(g, text) + 28);
+  int x = (W - w) / 2, y = 196;
+  g.fillRoundRect(x, y, w, 32, 8, TOAST_BG);
+  g.drawRoundRect(x, y, w, 32, 8, SELECT_EDGE);
+  drawCentered(g, fit(g, text, w - 20), W / 2, y + 7, TEXT);
 }
 
 // ---------- screens ----------
@@ -340,22 +520,7 @@ void drawBrief(lgfx::LovyanGFX& g, const Brief& b, const String& clock, bool sta
   }
 
   // The next hours: time, icon, temperature, chance of rain
-  if (b.hourCount > 0) {
-    int panelX = 6, panelY = 169, panelW = W - 12, panelH = 69;
-    g.fillRoundRect(panelX, panelY, panelW, panelH, 8, PANEL);
-    float columnW = (float)panelW / b.hourCount;
-    for (int i = 0; i < b.hourCount; i++) {
-      const Hour& h = b.hours[i];
-      int cx = panelX + columnW * (i + 0.5f);
-      g.setFont(&fonts::Font2);
-      drawCentered(g, h.time, cx, panelY + 2, DIM);
-      drawIcon(g, h.icon, h.day, cx, panelY + 29, 24, PANEL);
-      g.setFont(&fonts::FreeSansBold9pt7b);
-      drawCentered(g, tempText(h.temp), cx, panelY + 40, TEXT);
-      g.setFont(&fonts::Font2);
-      drawCentered(g, String(h.rain) + "%", cx, panelY + 53, h.rain >= 20 ? RAIN : FAINT);
-    }
-  }
+  hourPanel(g, b.hours, b.hourCount, 169);
 }
 
 void drawMessage(lgfx::LovyanGFX& g, const String& title, const String* lines, int count,
