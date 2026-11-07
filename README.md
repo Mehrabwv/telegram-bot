@@ -15,7 +15,7 @@ ESP32-S3 screen that shows the morning and afternoon weather brief, and there's 
 | `weather.py` | Forecasts from NWS and the ECMWF, GFS, ICON and GEM models (via Open-Meteo), blended into one. Every hour the earlier forecasts are checked against a weather station, so each source's weight follows its real accuracy. |
 | `news.py`, `stocks.py` | NYT headlines and stock prices for the hourly posts |
 | `memory.py` | Chat history and saved facts, kept in `memory_data/` |
-| `display.py` | Sends the weather brief to the display every 2 minutes |
+| `display.py` | Sends the weather brief and the top headlines to the display every 2 minutes |
 | `list_models.py` | Lists the Groq models your key can use |
 | [`esp32-display/`](esp32-display) | The display's firmware: XIAO ESP32-S3 + 2" ST7789 screen, built with PlatformIO |
 | [`esp32-display/case/`](esp32-display/case) | The case and desk dock: parametric model, STL files, build guide, 3D viewer |

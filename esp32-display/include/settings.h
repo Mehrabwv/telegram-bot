@@ -22,13 +22,26 @@
 #define PIN_CS 1    // D0  -> CS
 #define PIN_DC 2    // D1  -> DC
 #define PIN_RST 4   // D3  -> RES
+// Optional microSD module sharing SCK/MOSI: its CS is held high (deselected) so it
+// can't interfere with the screen. Harmless when nothing is connected to D5.
+#define PIN_SD_CS 6  // D5
 #define PIN_BOOT_BUTTON 0  // the "B" button. Hold it 3 seconds to set up Wi-Fi again.
 
 // The two buttons on top of the case. Each switch goes between its pin and GND.
-// Press one: status screen (Wi-Fi signal etc.). Hold both 3 seconds: Wi-Fi setup.
+//   A: next screen (weather -> headlines, page by page -> weather)
+//   B: back to the weather; on the weather, the status screen (Wi-Fi signal etc.)
+//   Hold both 3 seconds: Wi-Fi setup.
+// A short press of the XIAO's own B button works like A.
 #define PIN_BUTTON_A 3     // D2
 #define PIN_BUTTON_B 5     // D4
 #define STATUS_SECONDS 10  // how long the status screen stays up
+
+// Headlines: shown by themselves every NEWS_EVERY_MINUTES (0 = only with the buttons),
+// NEWS_PAGE_SECONDS per page, then back to the weather. Opened with a button, they stay
+// until NEWS_IDLE_SECONDS pass without a press.
+#define NEWS_EVERY_MINUTES 5
+#define NEWS_PAGE_SECONDS 10
+#define NEWS_IDLE_SECONDS 60
 
 // The header turns red ("bot offline") when the bot hasn't sent anything for this long
 #define STALE_MINUTES 10

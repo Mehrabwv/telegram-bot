@@ -175,7 +175,120 @@ uint32_t confidenceColor(const String& level) {
   return BAD;
 }
 
+// The header bar: title, a dim subtitle, and the clock on the right
+void drawHeader(lgfx::LovyanGFX& g, const String& title, const String& subtitle,
+                const String& clock, bool stale) {
+  g.fillRect(0, 0, W, 24, stale ? HEADER_STALE : HEADER);
+  g.setFont(&fonts::FreeSansBold9pt7b);
+  int clockWidth = clock.length() ? textWidth(g, clock) : 0;
+  if (clockWidth) drawText(g, clock, W - 8 - clockWidth, 4, TEXT);
+  int x = 8 + drawText(g, title, 8, 4, TEXT) + 8;
+  g.setFont(&fonts::FreeSans9pt7b);
+  drawText(g, fit(g, stale ? String("bot offline") : subtitle, W - 16 - clockWidth - x), x, 4,
+           stale ? 0xFCA5A5u : DIM);
+}
+
+// Splits text into at most `maxLines` lines of `maxWidth` pixels (the last one ends
+// in "..." if the text doesn't fit). Returns the number of lines.
+int wrapText(lgfx::LovyanGFX& g, const String& s, int maxWidth, int maxLines, String* out) {
+  int count = 0, pos = 0, len = s.length();
+  String line;
+  while (pos < len && count < maxLines) {
+    int space = s.indexOf(' ', pos);
+    if (space < 0) space = len;
+    int wordStart = pos;
+    String word = s.substring(pos, space);
+    pos = space + 1;
+    if (!word.length()) continue;
+    String trial = line.length() ? line + " " + word : word;
+    if (!line.length() || textWidth(g, trial) <= maxWidth) {
+      line = trial;
+      continue;
+    }
+    if (count == maxLines - 1) {  // no more lines: the rest goes here, cut short
+      out[count++] = fit(g, line + " " + s.substring(wordStart), maxWidth);
+      return count;
+    }
+    out[count++] = line;
+    line = word;
+  }
+  if (line.length() && count < maxLines) out[count++] = fit(g, line, maxWidth);
+  return count;
+}
+
+// Headline layout
+const int NEWS_TOP = 30, NEWS_BOTTOM = 238;
+const int NEWS_SECTION_H = 16, NEWS_LINE_H = 20, NEWS_GAP = 9, NEWS_MAX_LINES = 3;
+const int NEWS_TEXT_W = W - 16;
+const uint32_t SECTION_COLOR = 0x60A5FAu;
+const uint32_t DIVIDER = 0x1E293Bu;
+
+int headlineLines(lgfx::LovyanGFX& g, const Headline& item, String* lines) {
+  g.setFont(&fonts::FreeSans9pt7b);
+  return wrapText(g, item.title, NEWS_TEXT_W, NEWS_MAX_LINES, lines);
+}
+
+// Fills `starts` with the first headline of each page; returns the page count
+int layoutHeadlines(lgfx::LovyanGFX& g, const Headlines& h, int* starts, int maxPages) {
+  int pages = 0, y = NEWS_BOTTOM + 1;  // "full", so the first headline starts a page
+  String lines[NEWS_MAX_LINES];
+  for (int i = 0; i < h.count; i++) {
+    int height = NEWS_SECTION_H + headlineLines(g, h.items[i], lines) * NEWS_LINE_H;
+    if (y + height > NEWS_BOTTOM) {
+      if (pages == maxPages) break;
+      starts[pages++] = i;
+      y = NEWS_TOP;
+    }
+    y += height + NEWS_GAP;
+  }
+  return pages;
+}
+
 }  // namespace
+
+int headlinePages(lgfx::LovyanGFX& g, const Headlines& h) {
+  if (!h.ok) return 1;
+  int starts[MAX_HEADLINES];
+  return max(1, layoutHeadlines(g, h, starts, MAX_HEADLINES));
+}
+
+void drawHeadlines(lgfx::LovyanGFX& g, const Headlines& h, int page, const String& clock,
+                   bool stale) {
+  g.fillScreen(BG);
+  if (!h.ok) {
+    drawHeader(g, "Headlines", "", clock, stale);
+    g.setFont(&fonts::FreeSansBold9pt7b);
+    drawText(g, "No headlines yet", 10, 40, TEXT);
+    g.setFont(&fonts::FreeSans9pt7b);
+    drawText(g, "The bot sends them with the weather.", 10, 66, DIM);
+    drawText(g, "If this stays, restart the bot.", 10, 88, DIM);
+    return;
+  }
+  int starts[MAX_HEADLINES];
+  int pages = max(1, layoutHeadlines(g, h, starts, MAX_HEADLINES));
+  page = constrain(page, 0, pages - 1);
+  int first = starts[page], last = page + 1 < pages ? starts[page + 1] : h.count;
+
+  // "1/3  9:25 PM": the page, then when the bot collected them (cut first if short of room)
+  String subtitle = pages > 1 ? String(page + 1) + "/" + String(pages) : "";
+  if (h.made.length()) subtitle += (subtitle.length() ? "   " : "") + h.made;
+  drawHeader(g, "Headlines", subtitle, clock, stale);
+
+  int y = NEWS_TOP;
+  String lines[NEWS_MAX_LINES];
+  for (int i = first; i < last; i++) {
+    if (i > first) g.drawFastHLine(8, y - NEWS_GAP / 2 - 1, W - 16, DIVIDER);
+    String section = String(i + 1) + "  " + h.items[i].section;
+    section.toUpperCase();
+    g.setFont(&fonts::Font2);
+    drawText(g, fit(g, section, NEWS_TEXT_W), 8, y, SECTION_COLOR);
+    int count = headlineLines(g, h.items[i], lines);  // sets the title font
+    for (int l = 0; l < count; l++) {
+      drawText(g, lines[l], 8, y + NEWS_SECTION_H + l * NEWS_LINE_H, TEXT);
+    }
+    y += NEWS_SECTION_H + count * NEWS_LINE_H + NEWS_GAP;
+  }
+}
 
 // ---------- screens ----------
 
@@ -183,14 +296,7 @@ void drawBrief(lgfx::LovyanGFX& g, const Brief& b, const String& clock, bool sta
   g.fillScreen(BG);
 
   // Header: "Morning brief  8:00 AM" ............ "9:41 AM"
-  g.fillRect(0, 0, W, 24, stale ? HEADER_STALE : HEADER);
-  g.setFont(&fonts::FreeSansBold9pt7b);
-  int clockWidth = clock.length() ? textWidth(g, clock) : 0;
-  if (clockWidth) drawText(g, clock, W - 8 - clockWidth, 4, TEXT);
-  int x = 8 + drawText(g, b.title, 8, 4, TEXT) + 8;
-  g.setFont(&fonts::FreeSans9pt7b);
-  String subtitle = stale ? String("bot offline") : b.made;
-  drawText(g, fit(g, subtitle, W - 16 - clockWidth - x), x, 4, stale ? 0xFCA5A5u : DIM);
+  drawHeader(g, b.title, b.made, clock, stale);
 
   // Now: icon, temperature, feels like, conditions, high and low
   drawIcon(g, b.nowIcon, b.nowDay, 30, 52, 44, BG);

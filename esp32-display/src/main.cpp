@@ -8,12 +8,18 @@
 //   http://weather-display.local/brief            the brief on the screen
 //   http://weather-display.local/screenshot.bmp   a picture of the screen
 //
+//   http://weather-display.local/news             the headlines (the bot POSTs them here)
 //   http://weather-display.local/show-status      the status screen, for 10 seconds
+//   http://weather-display.local/press?button=a   acts as if button A (or b) was pressed
+//
+// Screens: the weather, the NYT headlines (a few pages), and a status screen.
+// Button A: next screen. Button B: back to the weather; on the weather, the status
+// screen. A short press of the XIAO's B button works like A. The headlines also
+// come up by themselves every few minutes (see settings.h).
 //
 // First start: the screen asks you to join the "Weather-Display-Setup" Wi-Fi
 // with your phone and pick your home Wi-Fi. To do that again (e.g. new Wi-Fi
 // password): hold both buttons on top for 3 seconds, or the XIAO's B button.
-// A short press on either top button shows the status screen (Wi-Fi signal etc.).
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -27,6 +33,7 @@
 
 #include "brief.h"
 #include "draw.h"
+#include "headlines.h"
 #include "screen_setup.h"
 #include "settings.h"
 
@@ -45,6 +52,15 @@ static long utcOffset = DEFAULT_UTC_OFFSET;
 static String shownClock;
 static bool shownStale = false;
 static uint32_t statusUntil = 0;  // the status screen is up until then (millis)
+
+static Headlines headlines;  // the NYT headlines the bot sent
+static String headlinesJson;
+enum class View { Weather, News };
+static View view = View::Weather;
+static int newsPage = 0;
+static bool newsByItself = false;  // came up on its own (turns pages by itself)
+static uint32_t viewSinceMs = 0;   // when the view or page last changed
+static uint32_t lastPressMs = 0;
 
 static lgfx::LovyanGFX& gfx() {
   return useCanvas ? static_cast<lgfx::LovyanGFX&>(canvas) : static_cast<lgfx::LovyanGFX&>(screen);
@@ -110,7 +126,7 @@ static void showStatus() {
       "IP: " + WiFi.localIP().toString(),
       "Bot: " + (lastBotMs ? "updated " + ago((millis() - lastBotMs) / 1000) + " ago" : String("nothing yet")),
       "Running for " + ago(millis() / 1000),
-      "",
+      "A: next screen   B: back to weather",
       "Hold both buttons 3 s: Wi-Fi setup",
   };
   drawMessage(gfx(), "Status", lines, 7, false);
@@ -124,7 +140,9 @@ static void render() {
   }
   shownClock = clockText();
   shownStale = isStale();
-  if (brief.ok) {
+  if (view == View::News) {
+    drawHeadlines(gfx(), headlines, newsPage, shownClock, shownStale);
+  } else if (brief.ok) {
     drawBrief(gfx(), brief, shownClock, shownStale);
   } else {
     showWaiting();
@@ -146,6 +164,71 @@ static void showSetupPortal(WiFiManager*) {
   Serial.println("Wi-Fi setup: join '" SETUP_WIFI_NAME "' with your phone");
 }
 
+// ---------- switching screens ----------
+
+static void showView(View next, int page, bool byItself) {
+  view = next;
+  newsPage = page;
+  newsByItself = byItself;
+  viewSinceMs = millis();
+  render();
+}
+
+// Weather -> headlines page 1 -> page 2 ... -> weather
+static void nextScreen() {
+  if (view == View::Weather) {
+    showView(View::News, 0, false);
+  } else if (newsPage + 1 < headlinePages(gfx(), headlines)) {
+    showView(View::News, newsPage + 1, false);
+  } else {
+    showView(View::Weather, 0, false);
+  }
+}
+
+// Button A (or the XIAO's B button): next screen
+static void pressA() {
+  lastPressMs = millis();
+  statusUntil = 0;
+  nextScreen();
+}
+
+// Button B: back to the weather; on the weather, the status screen
+static void pressB() {
+  lastPressMs = millis();
+  if (view == View::Weather && !statusShowing()) {
+    statusUntil = millis() + STATUS_SECONDS * 1000UL;
+    render();
+  } else {
+    statusUntil = 0;
+    showView(View::Weather, 0, false);
+  }
+}
+
+// Once a second: turn the headline pages, go back to the weather, or bring the
+// headlines up by themselves
+static void timeScreens() {
+  if (statusShowing()) return;
+  uint32_t now = millis();
+  if (view == View::News) {
+    uint32_t limit = (newsByItself ? NEWS_PAGE_SECONDS : NEWS_IDLE_SECONDS) * 1000UL;
+    if (now - viewSinceMs < limit) return;
+    if (newsByItself && newsPage + 1 < headlinePages(gfx(), headlines)) {
+      showView(View::News, newsPage + 1, true);
+    } else {
+      showView(View::Weather, 0, false);
+    }
+  } else if (NEWS_EVERY_MINUTES > 0 && headlines.ok && brief.ok &&
+             now - viewSinceMs >= NEWS_EVERY_MINUTES * 60000UL &&
+             (!lastPressMs || now - lastPressMs >= 60000UL)) {
+    showView(View::News, 0, true);
+  }
+}
+
+static const char* viewName() {
+  if (statusShowing()) return "status";
+  return view == View::News ? "headlines" : "weather";
+}
+
 // ---------- web server (the bot talks to these) ----------
 
 static void sendJson(int code, JsonDocument& doc) {
@@ -163,6 +246,9 @@ static void handleStatus() {
   doc["wifi_signal_dbm"] = WiFi.RSSI();
   doc["uptime_s"] = millis() / 1000;
   doc["brief"] = brief.ok ? brief.id : "";
+  doc["headlines"] = headlines.ok ? headlines.id : "";
+  doc["screen"] = viewName();
+  if (view == View::News) doc["page"] = newsPage + 1;
   if (lastBotMs) doc["seconds_since_bot"] = (millis() - lastBotMs) / 1000;
   else doc["seconds_since_bot"] = nullptr;
   doc["clock"] = clockText();
@@ -208,6 +294,56 @@ static void handlePostBrief() {
   doc["changed"] = changed;
   sendJson(200, doc);
   if (changed || wasStale) render();
+}
+
+static void handlePostNews() {
+  String body = server.arg("plain");
+  Headlines incoming;
+  String error;
+  if (!parseHeadlines(body, incoming, error)) {
+    JsonDocument doc;
+    doc["ok"] = false;
+    doc["error"] = error;
+    sendJson(400, doc);
+    return;
+  }
+  bool changed = incoming.id != headlines.id || !headlines.ok;
+  headlines = incoming;
+  headlinesJson = body;
+  if (changed) {
+    Serial.printf("New headlines: %s (%d)\n", headlines.id.c_str(), headlines.count);
+    if (body.length() < 3900) storage.putString("news", body);  // shown again after a restart
+  }
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["changed"] = changed;
+  sendJson(200, doc);
+  if (changed && view == View::News && !statusShowing()) {
+    newsPage = min(newsPage, headlinePages(gfx(), headlines) - 1);
+    render();
+  }
+}
+
+static void handleGetNews() {
+  if (headlinesJson.length()) {
+    server.send(200, "application/json", headlinesJson);
+  } else {
+    server.send(404, "application/json", "{\"error\":\"no headlines yet\"}");
+  }
+}
+
+// Acts like a button press, for trying the screens from a browser
+static void handlePress() {
+  String which = server.arg("button");
+  which.toLowerCase();
+  if (which == "a") pressA();
+  else if (which == "b") pressB();
+  else {
+    server.send(400, "text/plain", "Use /press?button=a or /press?button=b\n");
+    return;
+  }
+  String page = view == View::News && !statusShowing() ? " page " + String(newsPage + 1) : "";
+  server.send(200, "text/plain", String("Now showing: ") + viewName() + page + "\n");
 }
 
 static void handleGetBrief() {
@@ -269,24 +405,20 @@ static void restartIntoWifiSetup() {
   ESP.restart();
 }
 
-// The XIAO's own B button (a pinhole in the case): hold 3 seconds for Wi-Fi setup
-static void checkBootButton() {
-  static uint32_t pressedSince = 0;
-  if (digitalRead(PIN_BOOT_BUTTON) != LOW) {
-    pressedSince = 0;
-    return;
-  }
-  if (!pressedSince) pressedSince = millis();
-  if (millis() - pressedSince >= 3000) restartIntoWifiSetup();
-}
-
-// The two buttons on top: a short press shows the status screen; both held 3 s = Wi-Fi setup
+// The buttons: A and B on top of the case, and the XIAO's own B button (a pinhole).
+// A short press (under 1.5 s) acts on release. Holding both top buttons, or the
+// XIAO's B button, for 3 seconds starts Wi-Fi setup.
 struct Button {
   uint8_t pin;
+  void (*onPress)();
   bool down;
   uint32_t changedMs, downSince;
 };
-static Button buttons[2] = {{PIN_BUTTON_A, false, 0, 0}, {PIN_BUTTON_B, false, 0, 0}};
+static Button buttons[3] = {
+    {PIN_BUTTON_A, pressA, false, 0, 0},
+    {PIN_BUTTON_B, pressB, false, 0, 0},
+    {PIN_BOOT_BUTTON, pressA, false, 0, 0},
+};
 
 static void checkButtons() {
   uint32_t now = millis();
@@ -299,14 +431,12 @@ static void checkButtons() {
       b.downSince = now;
     } else if (now - b.downSince < 1500) {
       Serial.printf("Button on GPIO %d pressed\n", b.pin);
-      statusUntil = now + STATUS_SECONDS * 1000UL;
-      render();
+      b.onPress();
     }
   }
-  if (buttons[0].down && buttons[1].down && now - buttons[0].downSince >= 3000 &&
-      now - buttons[1].downSince >= 3000) {
-    restartIntoWifiSetup();
-  }
+  Button &a = buttons[0], &bb = buttons[1], &boot = buttons[2];
+  bool bothHeld = a.down && bb.down && now - a.downSince >= 3000 && now - bb.downSince >= 3000;
+  if (bothHeld || (boot.down && now - boot.downSince >= 3000)) restartIntoWifiSetup();
 }
 
 // ---------- start ----------
@@ -316,6 +446,8 @@ void setup() {
   pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);
   pinMode(PIN_BUTTON_A, INPUT_PULLUP);  // not wired yet = reads "not pressed"
   pinMode(PIN_BUTTON_B, INPUT_PULLUP);
+  pinMode(PIN_SD_CS, OUTPUT);  // keep the SD module off the shared SPI lines
+  digitalWrite(PIN_SD_CS, HIGH);
 
   screen.init();
   screen.setRotation(SCREEN_ROTATION);
@@ -334,6 +466,12 @@ void setup() {
     brief = stored;
     briefJson = saved;
     utcOffset = stored.utcOffset;
+  }
+  String savedNews = storage.getString("news", "");
+  Headlines storedNews;
+  if (savedNews.length() && parseHeadlines(savedNews, storedNews, error)) {
+    headlines = storedNews;
+    headlinesJson = savedNews;
   }
   startClock();
 
@@ -370,6 +508,9 @@ void setup() {
   server.on("/", HTTP_GET, handleStatus);
   server.on("/brief", HTTP_POST, handlePostBrief);
   server.on("/brief", HTTP_GET, handleGetBrief);
+  server.on("/news", HTTP_POST, handlePostNews);
+  server.on("/news", HTTP_GET, handleGetNews);
+  server.on("/press", HTTP_GET, handlePress);
   server.on("/screenshot.bmp", HTTP_GET, handleScreenshot);
   server.on("/show-status", HTTP_GET, [] {
     statusUntil = millis() + STATUS_SECONDS * 1000UL;
@@ -384,13 +525,13 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  checkBootButton();
   checkButtons();
 
   static uint32_t lastCheck = 0;
   static bool statusWasShowing = false;
   if (millis() - lastCheck >= 1000) {
     lastCheck = millis();
+    timeScreens();
     bool status = statusShowing();
     if (status || statusWasShowing) {
       render();  // the status screen updates every second; then back to the weather

@@ -27,6 +27,10 @@ your computer and sends the brief to the display over Wi-Fi every 2 minutes.
 - **Right now** at all other times, refreshed every 30 minutes. After 9 PM the
   cards are for tomorrow.
 - The header turns **red ("bot offline")** if the bot hasn't sent anything for 10 minutes.
+- **Headlines:** the top 9 NYT headlines the bot collected (the same ones as its
+  hourly posts), 2 or 3 per page. Every 5 minutes they come up by themselves for
+  10 seconds a page, then the weather returns. Change this in `include/settings.h`
+  (`NEWS_EVERY_MINUTES`, 0 = only with the buttons).
 
 ## Wiring (already done)
 
@@ -92,11 +96,21 @@ the weather, and the bot prints `Display connected`.
 
 ## Buttons
 
-Two buttons can be wired to **D2** and **D4** (each switch between its pin and GND):
+Two buttons can be wired to **D2** (A) and **D4** (B), each switch between its pin and GND:
 
-- **Press either one:** status screen for 10 seconds (Wi-Fi signal, IP, last update
-  from the bot). You can also open `http://weather-display.local/show-status` for it.
-- **Hold both for 3 seconds:** Wi-Fi setup, same as holding the XIAO's B button.
+| Button | Short press |
+|---|---|
+| **A** | Next screen: weather → headlines page 1 → page 2 … → weather |
+| **B** | Back to the weather. On the weather: the status screen for 10 seconds (Wi-Fi signal, IP, last update from the bot) |
+| **The XIAO's B button** | Same as A, so it works before the case buttons are wired |
+
+- **Hold both A and B (or the XIAO's B button) for 3 seconds:** Wi-Fi setup.
+- Headlines opened with a button stay until 60 seconds pass without a press.
+- From a browser on the same Wi-Fi: `http://weather-display.local/press?button=a`
+  (or `b`) acts like a press, and `/show-status` shows the status screen.
+
+If the laptop can't reach the display (the bot says "Display not reachable"), a VPN
+may be blocking your local network: allow LAN connections in it, or disconnect it.
 
 ## 3D-printed case
 
@@ -108,7 +122,8 @@ list, wiring, assembly). Start with [case/README.md](case/README.md).
 
 - `include/settings.h`: pins, screen orientation and colors, names
 - `src/main.cpp`: Wi-Fi, the web server the bot talks to, the clock
-- `src/draw.cpp`: the screen layout and the weather icons
+- `src/draw.cpp`: the screen layouts (weather, headlines) and the weather icons
 - `src/brief.cpp`: reads the brief the bot sends (JSON)
+- `src/headlines.cpp`: reads the headlines the bot sends (JSON)
 - `case/`: the 3D-printed case and dock (`build_case.py` makes the STL files)
 - The bot's side: `display.py` in the bot folder

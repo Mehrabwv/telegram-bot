@@ -10,16 +10,21 @@ What it shows:
 - otherwise "Right now", the same layout refreshed every LIVE_EVERY_MINUTES.
 Each brief: now (temperature, feels like, conditions, high/low), jacket / cap /
 umbrella (a colored card = bring it), and the next BRIEF_HOURS hours.
+
+It also gets the top NEWS_ON_DISPLAY NYT headlines (the ones the bot already
+collected), for its headlines screen.
 """
 
 import asyncio
 import ipaddress
 import socket
 import time
+import unicodedata
 from datetime import datetime, timedelta
 
 import httpx
 
+from news import latest_news, section_label
 from weather import (
     advice_facts,
     clock,
@@ -40,6 +45,7 @@ SEND_EVERY_MINUTES = 2  # how often the bot sends the brief (the display marks i
 BRIEF_HOURS = 5  # the next hours shown, and how long a morning/afternoon brief stays up
 LIVE_EVERY_MINUTES = 30  # between briefs, "Right now" is rebuilt this often
 TIMEOUT_SECONDS = 5
+NEWS_ON_DISPLAY = 9  # headlines sent to the display (it shows them a few per page)
 
 TITLES = {"morning": "Morning brief", "afternoon": "Afternoon brief", "now": "Right now"}
 
@@ -63,6 +69,11 @@ TEXT_ICONS = (
     ("clear", "clear"), ("fair", "clear"), ("sunny", "clear"),
 )
 MAX_TEXT_LENGTH = 16  # longer station descriptions are replaced by the short name
+# The display's fonts only have plain ASCII letters
+PLAIN_PUNCTUATION = str.maketrans({
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "–": "-", "—": " - ", "…": "...", " ": " ",
+})
 
 _lock = asyncio.Lock()
 _live = None  # the latest "Right now" brief
@@ -208,6 +219,29 @@ def build_brief(weather, kind, made=None):
     }
 
 
+def plain_text(text):
+    """Text the display can draw: curly quotes, dashes and accents become ASCII."""
+    text = unicodedata.normalize("NFKD", text.translate(PLAIN_PUNCTUATION))
+    return " ".join(text.encode("ascii", "ignore").decode().split())
+
+
+def build_headlines():
+    """The headlines screen, as a JSON-ready dict, or None if none are collected yet."""
+    news = latest_news()
+    if news["time"] is None or not news["ranked"]:
+        return None
+    items = [
+        {"title": plain_text(article["title"]), "section": plain_text(section_label(article["section"]))}
+        for article in news["ranked"][:NEWS_ON_DISPLAY]
+    ]
+    return {
+        "v": 1,
+        "id": news["time"].isoformat(timespec="minutes"),
+        "made": clock(news["time"].isoformat(timespec="minutes")),
+        "items": [item for item in items if item["title"]],
+    }
+
+
 def brief_is_current(brief, now):
     """A morning/afternoon brief stays up for the hours it covers."""
     if not brief or brief.get("v") != 1 or not brief.get("made_at"):
@@ -264,6 +298,18 @@ def went_offline(reason):
     _online = False
 
 
+async def send_headlines(client, ip):
+    """The headlines, for the display's headlines screen. Not essential: a display
+    with older firmware (no /news) or a failed send is skipped quietly."""
+    headlines = build_headlines()
+    if headlines is None:
+        return
+    try:
+        await client.post(f"http://{ip}:{DISPLAY_PORT}/news", json=headlines)
+    except httpx.HTTPError:
+        pass
+
+
 async def update(stored_brief):
     """Send the display what it should show now. stored_brief: the latest
     morning/afternoon brief (or None). Skips if an update is already running."""
@@ -292,6 +338,7 @@ async def update(stored_brief):
             except httpx.HTTPError as error:
                 went_offline(type(error).__name__)
                 return
+            await send_headlines(client, ip)
         if _online is not True:
             print(f"Display connected: {DISPLAY_HOST} ({ip})")
         _online, _last_ip = True, ip
