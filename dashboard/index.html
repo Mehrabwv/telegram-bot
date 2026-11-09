@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Briefing</title>
+<meta name="description" content="Your bot's news, stocks, weather and free games in one place.">
+<meta name="theme-color" content="#1d2a5c">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon-192.png">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div class="shell">
+  <nav class="nav" aria-label="Sections">
+    <div class="brand"><img src="/icons/icon-192.png" alt=""><span>Briefing</span></div>
+    <a href="#today" data-view="today"><span class="ni">🏠</span><span>Today</span></a>
+    <a href="#news" data-view="news"><span class="ni">📰</span><span>News</span></a>
+    <a href="#stocks" data-view="stocks"><span class="ni">📈</span><span>Stocks</span></a>
+    <a href="#weather" data-view="weather"><span class="ni">🌤️</span><span>Weather</span></a>
+    <a href="#free" data-view="free"><span class="ni">🎁</span><span>Free</span></a>
+    <a href="#inbox" data-view="inbox"><span class="ni">🔔</span><span>Inbox</span></a>
+    <a href="#settings" data-view="settings" class="nav-settings"><span class="ni">⚙️</span><span>Settings</span></a>
+  </nav>
+  <main id="main" tabindex="-1"><p class="loading">Loading…</p></main>
+</div>
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-back" data-close></div>
+  <aside class="drawer-panel" role="dialog" aria-modal="true" aria-label="Story">
+    <button class="drawer-close" data-close aria-label="Close">✕</button>
+    <div id="drawer-body"></div>
+  </aside>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

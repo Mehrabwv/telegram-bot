@@ -18,6 +18,9 @@ ESP32-S3 screen that shows the morning and afternoon weather brief, and there's 
 | `curation.py` | Picks the news for you: the AI rates every new story (major, important, tech/science) and learns from your 👍/👎 |
 | `memory.py` | Chat history and saved facts, kept in `memory_data/` |
 | `display.py` | Sends the weather, headlines and stocks to the display every 2 minutes, and passes its "send to my phone" presses to Telegram |
+| `dashboard.py`, [`dashboard/`](dashboard) | The Briefing app: news, stocks, weather, free games and an inbox, with Windows notifications (see below) |
+| `webpush.py` | Sends the app's notifications (Web Push, encrypted for each device; no outside service) |
+| `scripts/briefing-links.ps1` | The link helper: makes the app open links in your default browser (Opera) instead of Edge |
 | `scripts/nightly-github-push.ps1` | Uploads the day's changes to GitHub every night (a Windows scheduled task); refuses if a key would be uploaded |
 | `list_models.py` | Lists the Groq models your key can use |
 | [`esp32-display/`](esp32-display) | The display's firmware: XIAO ESP32-S3 + 2" ST7789 screen, built with PlatformIO |
@@ -45,6 +48,9 @@ ESP32-S3 screen that shows the morning and afternoon weather brief, and there's 
 
 Any other message is answered by the AI (Groq).
 
+Everything the bot sends on a schedule also goes to the dashboard app (below), as a
+Windows notification and in its inbox.
+
 ## Scheduled messages
 
 | When | What |
@@ -60,6 +66,81 @@ Digests list major news first, then important news, then tech and science. A sto
 never sent twice unless NYT changed its headline. Rate stories with the 👍/👎 buttons
 under them: the AI uses your ratings to judge what you'd like (kept in `news_memory.json`).
 
+## Dashboard app (Briefing)
+
+The bot also runs a small app for your computers, with more detail than Telegram:
+
+- **Today:** the weather, your stocks, new stories and the bot's latest messages
+- **News:** every collected story in the AI's order, filters (new to you, major, important,
+  tech & science, rated), each story's details and the AI's scores, 👍/👎
+- **Stocks:** price charts (1 day to 1 year), previous close, today's range, NYT stories
+- **Weather:** now, what to bring, the next 24 hours, 7 days, how much each source counts
+- **Free:** every game and app that is free to keep right now, with a picture, what kind of
+  game it is and its review score. Hover over one for its screenshots and description; click
+  for all the pictures and links to its reviews and gameplay videos. (The details come from
+  Steam, SteamSpy and the Play Store; Telegram's `/free` shows the type and score too.)
+- **Inbox:** everything the bot sent (breaking news, digests, stock checks, weather), in full
+
+Ratings in the app are the same as the 👍/👎 in Telegram. A story you open in the app
+counts as seen: the bot won't send it to you again.
+
+### On this computer
+
+1. Start the bot (`py bot.py`). It prints `Dashboard app: http://localhost:8765`.
+2. Open **http://localhost:8765** in Edge.
+3. Install it: the **App available** icon at the right end of the address bar (or
+   ⋯ → Apps → Install this site as an app). It gets its own window and Start menu entry.
+4. In the app: **Settings → Turn on notifications**, then **Send a test**.
+
+Notifications pop up in Windows even when the app is closed, as long as Edge is allowed
+to run in the background (Edge → Settings → System and performance → "Continue running
+background extensions and apps when Microsoft Edge is closed", on by default).
+
+### Links open in your own browser (Opera)
+
+Opera can't install web apps, so the app is installed from Edge, and an app installed from
+Edge would open every link (NYT stories, claim pages) in Edge. Instead:
+
+- **On the computer the bot runs on:** nothing to do. The bot opens the app's links in your
+  default browser.
+- **On your other computers:** install the link helper once. In the app: Settings → Open
+  links → download the link helper, right-click it → Run with PowerShell, then tick "Use the
+  link helper on this computer". The first link asks "Open Briefing link?": tick Always allow.
+  It adds a `briefing-open:` link type for your Windows user only (no admin) and opens only
+  web links, in your default browser. Remove it with
+  `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Briefing\briefing-links.ps1" -Uninstall`.
+  Once the bot moves to the Raspberry Pi, use the helper on this computer too.
+- **Or skip installing:** open the app in an Opera tab (pin it). Links then open in Opera, but
+  notifications only come while Opera is running.
+
+### On your other devices (and away from home): Tailscale
+
+The app only listens on this computer, so other devices reach it through
+[Tailscale](https://tailscale.com) (free), a private network between your own devices.
+Nothing is opened to the internet, and it works from anywhere, not just your home Wi-Fi.
+Tailscale also gives the app an `https://` address, which notifications need.
+
+1. Install Tailscale on this computer and on the other device, and sign in to the same
+   account on both.
+2. On this computer, in a terminal: `tailscale serve --bg 8765`
+   The first time, it asks you to turn on HTTPS for your Tailscale network (one click).
+   It then prints the app's address, like `https://your-laptop.tail1234.ts.net`.
+3. On the other device, open that address in Edge, install it and turn on notifications
+   (steps 3–4 above).
+
+Notes:
+- The bot (and so the app) only works while this computer is on and awake. Moving the bot
+  to the Raspberry Pi later fixes that; the app works the same there.
+- A VPN (like Proton VPN) can get in Tailscale's way. If the address doesn't open, try
+  with the VPN off.
+- `tailscale serve --bg off` stops sharing the app.
+
+### Try it without the bot
+
+`py dashboard.py` runs the app on its own (no Telegram, no notifications from the bot). It
+downloads the headlines first (about a minute) and uses copies of your ratings and inbox.
+It uses port 8765 like the bot; while the bot runs, use another: `py dashboard.py --port 8766`.
+
 ## Kept off GitHub
 
 These stay on your computer only (see `.gitignore`):
@@ -67,3 +148,7 @@ These stay on your computer only (see `.gitignore`):
 - `memory_data/`: chat history and saved facts
 - `state.json` and `weather_accuracy.json`: the bot's schedule and learned weather accuracy
 - `news_memory.json`: your news ratings and the AI's scores
+- `dashboard_keys.json`: the app's private key for signing notifications
+- `dashboard_subscriptions.json`, `dashboard_inbox.json`: your devices' notification
+  addresses, and the app's inbox
+- `freebies_details.json`: the free games' details, looked up once and kept for 2 weeks

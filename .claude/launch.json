@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard-preview",
+      "runtimeExecutable": "py",
+      "runtimeArgs": ["-u", "dashboard.py"],
+      "port": 8765
+    },
+    {
+      "name": "dashboard-preview-8766",
+      "runtimeExecutable": "py",
+      "runtimeArgs": ["-u", "dashboard.py", "--port", "8766"],
+      "port": 8766
+    }
+  ]
+}

@@ -139,6 +139,35 @@ async def get_quotes():
     return {ticker: quote for (ticker, _), quote in zip(WATCHLIST, quotes)}
 
 
+# The dashboard's charts: how far back, and one point per...
+CHART_RANGES = {"1d": "5m", "5d": "30m", "1mo": "1d", "6mo": "1d", "1y": "1wk"}
+
+
+async def get_chart(ticker, span="1d"):
+    """Price history for the dashboard: {"points": [[unix time, price]], "previous"},
+    or None if Yahoo didn't answer."""
+    if span not in CHART_RANGES:
+        return None
+    async with httpx.AsyncClient(timeout=15, headers=YAHOO_HEADERS) as client:
+        for host in YAHOO_HOSTS:
+            try:
+                response = await client.get(
+                    f"https://{host}/v8/finance/chart/{ticker}",
+                    params={"range": span, "interval": CHART_RANGES[span]},
+                )
+                response.raise_for_status()
+                result = response.json()["chart"]["result"][0]
+                times = result.get("timestamp") or []
+                closes = result["indicators"]["quote"][0].get("close") or []
+            except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+                print(f"Stock chart for {ticker} failed on {host}: {type(error).__name__}")
+                continue
+            points = [[t, round(p, 4)] for t, p in zip(times, closes) if isinstance(p, (int, float))]
+            previous = result["meta"].get("chartPreviousClose") if span == "1d" else None
+            return {"points": points, "previous": previous}
+    return None
+
+
 # =====================================
 # MESSAGE
 # =====================================

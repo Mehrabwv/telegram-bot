@@ -30,3 +30,11 @@ esp32-display/case/cadenv/
 # Weather experiment output
 weather_experiment/data/
 weather_experiment/*.log
+
+# The dashboard app's private key, your devices' notification addresses and its inbox
+dashboard_keys.json
+dashboard_subscriptions.json
+dashboard_inbox.json
+
+# Free games: details looked up from Steam and the Play Store (a cache)
+freebies_details.json

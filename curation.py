@@ -343,12 +343,16 @@ def article_by_id(story_id):
 
 
 def record_rating(story_id, rating):
-    """Saves your 👍 (1) or 👎 (-1). Returns the story's title, or None if unknown."""
+    """Saves your 👍 (1) or 👎 (-1); 0 takes a rating back. Returns the story's
+    title, or None if unknown."""
     memory = load()
     story = memory["articles"].get(story_id)
     if story is None:
         return None
     memory["ratings"] = [r for r in memory["ratings"] if r["id"] != story_id]
+    if rating == 0:
+        save()
+        return story["title"]
     memory["ratings"].append({
         "id": story_id, "title": story["title"], "section": story["section"],
         "rating": rating, "at": stamp(),

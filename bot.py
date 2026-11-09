@@ -20,6 +20,7 @@ from telegram.ext import (
 )
 
 import curation
+import dashboard
 import display
 import freebies
 from config import GROQ_API_KEY, GROQ_MODEL, MY_CHAT_ID, NYT_API_KEY, TELEGRAM_TOKEN
@@ -491,7 +492,7 @@ async def freebies_section(only_new=True):
     """'🎁 Free to keep': games and apps that are free for a limited time (see freebies.py).
     only_new: leave out ones already reported (and remember these). None if nothing."""
     try:
-        found = await freebies.get_freebies()
+        found = await freebies.add_details(await freebies.get_freebies())
     except Exception as error:
         print(f"Free games/apps failed: {type(error).__name__}")
         return None
@@ -547,6 +548,24 @@ async def send_stocks_now(bot, chat_id):
     print("Stocks sent.")
 
 
+def plain(message):
+    """Telegram HTML -> plain text (for Windows notifications)."""
+    return html.unescape(re.sub(r"<[^>]+>", "", message)).strip()
+
+
+def headline_list(stories, shown=3):
+    """'1. First headline\\n2. Second…\\n+3 more' for a notification."""
+    lines = [f"{n}. {story['title']}" for n, story in enumerate(stories[:shown], 1)]
+    if len(stories) > shown:
+        lines.append(f"+{len(stories) - shown} more")
+    return "\n".join(lines)
+
+
+def has_audience(state):
+    """Someone gets the scheduled messages: a Telegram subscriber or the dashboard app."""
+    return bool(state["subscribers"]) or dashboard.has_listeners()
+
+
 async def send_to_subscribers(app: Application, subscribers, message, what, keyboard=None):
     sent = 0
     for chat_id in subscribers:
@@ -585,13 +604,15 @@ def is_quiet(state, moment):
 async def send_alerts(app: Application, news):
     """Breaking news: only major stories the AI rated very urgent (usually none)."""
     state = load_state()
-    if not state["subscribers"] or is_quiet(state, datetime.now()):
+    if not has_audience(state) or is_quiet(state, datetime.now()):
         return
     for article in curation.pick_alerts(news["ranked"], stock_story_urls(news)):
         message = "🚨 <b>Breaking news</b>\n\n" + story_block(None, article)
         curation.mark_sent([article], alert=True)  # first, so it can never go out twice
         await send_to_subscribers(app, state["subscribers"], message, "breaking news",
                                   rating_keyboard([article]))
+        await dashboard.notify("alert", "🚨 Breaking news", article["title"], message, [article],
+                               urgent=True, open_story=article)
 
 
 # =====================================
@@ -641,7 +662,7 @@ def tomorrow_weather(weather):
 async def post_digest(app: Application, kind):
     state = load_state()
     today = datetime.now().date().isoformat()
-    if state["digest_sent"].get(kind) == today or not state["subscribers"]:
+    if state["digest_sent"].get(kind) == today or not has_audience(state):
         return
     state["digest_sent"][kind] = today  # saved first, so it can never go out twice
     save_state(state)
@@ -677,9 +698,23 @@ async def post_digest(app: Application, kind):
         message = compose(True)
         if len(message) > 4000:  # Telegram's limit is 4096 characters
             message = compose(False)
+        if len(message) > 4000:  # still too long: the free games without their "what is it" lines
+            after = [re.sub(r"\n    <i>.*?</i>", "", part) for part in after]
+            message = compose(False)
 
     await send_to_subscribers(app, state["subscribers"], message, f"{kind} digest", keyboard)
     curation.mark_sent(stories)
+
+    # The dashboard app: the whole message in its inbox, a short notification
+    if kind == "stocks":
+        moves = big_moves(quotes)
+        body = plain(moves).replace("⚡ Big moves: ", "Big moves: ") if moves else ", ".join(
+            f"{ticker} {price_text(quote)}" for ticker, quote in quotes.items() if quote)
+        title = "📈 Stock check"
+    else:
+        title = "🌅 Your morning news" if kind == "morning" else "🌙 Night summary"
+        body = headline_list(stories) if stories else plain(nothing_new)
+    await dashboard.notify(kind, title, body, message, stories)
 
 
 # =====================================
@@ -718,10 +753,18 @@ async def post_weather_update(app: Application, kind):
     state["weather_sent"][kind] = today
     state["display_brief"] = display.build_brief(weather, kind)  # for the ESP32 screen
     save_state(state)
-    await send_to_subscribers(
-        app, state["subscribers"], format_weather_update(weather, kind), f"{kind} weather"
-    )
+    message = format_weather_update(weather, kind)
+    await send_to_subscribers(app, state["subscribers"], message, f"{kind} weather")
     await update_display()
+
+    brief = state["display_brief"]
+    bring = [item["name"].lower() for item in brief["items"] if item["need"]]
+    high_low = ", ".join(f"{name} {brief[key]}°" for name, key in (("high", "high"), ("low", "low"))
+                         if brief[key] is not None)
+    body = (f"{brief['now']['temp']}° {brief['now']['text']}" + (f", {high_low}" if high_low else "") + ". "
+            + (f"Bring: {', '.join(bring)}." if bring else "Nothing extra to bring."))
+    await dashboard.notify("weather", f"{'☀️ Morning' if kind == 'morning' else '🌤️ Afternoon'} weather",
+                           body, message)
 
 
 async def update_display():
@@ -874,8 +917,10 @@ async def send_display_request(app: Application, request):
         story = curation.article_by_id(item)
         if story is None:
             return
-        await send_news(app.bot, chat_id, "📌 <b>From your display</b>\n\n" + story_block(None, story),
-                        rating_keyboard([story]))
+        message = "📌 <b>From your display</b>\n\n" + story_block(None, story)
+        await send_news(app.bot, chat_id, message, rating_keyboard([story]))
+        await dashboard.notify("display", "📌 From your display", story["title"], message, [story],
+                               open_story=story)
         print(f"Display: sent a story to the phone: {story['title']}")
     elif kind == "stock":
         quotes = await get_quotes()
@@ -889,6 +934,8 @@ async def send_display_request(app: Application, request):
             url = html.escape(article["url"], quote=True)
             lines.append(f'• <a href="{url}">{html.escape(article["title"])}</a>')
         await send_news(app.bot, chat_id, "\n".join(lines))
+        await dashboard.notify("display", f"📌 {item} from your display", plain(lines[0].split(": ", 1)[-1]),
+                               "\n".join(lines))
         print(f"Display: sent {item} to the phone")
 
 
@@ -927,9 +974,11 @@ async def rate_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     app.bot_data["clock_task"] = asyncio.create_task(clock_loop(app))
     app.bot_data["display_task"] = asyncio.create_task(display_request_loop(app))
+    await dashboard.start()
 
 
 async def post_shutdown(app: Application):
+    await dashboard.stop()
     tasks = [task for task in (app.bot_data.get("clock_task"), app.bot_data.get("display_task"),
                                *_background_tasks) if task]
     for task in tasks:
@@ -1241,6 +1290,8 @@ def main():
     )
     if display.DISPLAY_HOST:
         print(f"Weather display: {display.DISPLAY_HOST}, every {display.SEND_EVERY_MINUTES} minutes")
+    print(f"Dashboard app: http://localhost:{dashboard.PORT} "
+          f"({dashboard.webpush.device_count()} device(s) with notifications on)")
     print("Memory: saved in the memory_data folder")
     print("Bot running...")
     print("Press Ctrl+C to stop.")
