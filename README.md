@@ -21,6 +21,7 @@ ESP32-S3 screen that shows the morning and afternoon weather brief, and there's 
 | `dashboard.py`, [`dashboard/`](dashboard) | The Briefing app: news, stocks, weather, free games and an inbox, with Windows notifications (see below) |
 | `webpush.py` | Sends the app's notifications (Web Push, encrypted for each device; no outside service) |
 | `scripts/briefing-links.ps1` | The link helper: makes the app open links in your default browser (Opera) instead of Edge |
+| `scripts/pi-install.sh` | Sets the bot up on a Raspberry Pi as a service that starts at boot (see below) |
 | `scripts/nightly-github-push.ps1` | Uploads the day's changes to GitHub every night (a Windows scheduled task); refuses if a key would be uploaded |
 | `list_models.py` | Lists the Groq models your key can use |
 | [`esp32-display/`](esp32-display) | The display's firmware: XIAO ESP32-S3 + 2" ST7789 screen, built with PlatformIO |
@@ -140,6 +141,47 @@ Notes:
 `py dashboard.py` runs the app on its own (no Telegram, no notifications from the bot). It
 downloads the headlines first (about a minute) and uses copies of your ratings and inbox.
 It uses port 8765 like the bot; while the bot runs, use another: `py dashboard.py --port 8766`.
+
+## Run it on a Raspberry Pi
+
+A Raspberry Pi Zero 2 W can run the bot day and night (about 1 W), so it no longer
+depends on the laptop being on. Only one copy of the bot may run at a time: stop it on the
+laptop when the Pi takes over.
+
+**1. Prepare the SD card (on the laptop).** In [Raspberry Pi Imager](https://www.raspberrypi.com/software/):
+- Device: Raspberry Pi Zero 2 W. OS: Raspberry Pi OS (other) → **Raspberry Pi OS Lite (64-bit)**.
+- Edit settings: hostname `briefing-pi`, your username and password, your Wi-Fi (the
+  Zero 2 W only does 2.4 GHz), time zone `America/Phoenix`; Services tab → enable SSH.
+- Write it, put the card in the Pi and power it. The first boot takes a few minutes.
+
+**2. Connect to it** from PowerShell on the laptop: `ssh yourname@briefing-pi.local`
+
+**3. Get the code** (on the Pi): `git clone https://github.com/Mehrabwv/telegram-bot.git`
+
+**4. Copy your private files** (on the laptop, in a second PowerShell; they're not on
+GitHub). Stop the bot on the laptop first (Ctrl+C), so the files are final:
+```
+cd C:\Users\mehra\telegram-bot
+scp config.py .env state.json news_memory.json weather_accuracy.json dashboard_keys.json dashboard_inbox.json freebies_details.json yourname@briefing-pi.local:telegram-bot/
+scp -r memory_data yourname@briefing-pi.local:telegram-bot/
+```
+
+**5. Install and start it** (on the Pi): `cd telegram-bot && bash scripts/pi-install.sh`
+It installs the packages and a service that starts the bot at every boot and restarts it if
+it crashes. Check it with `journalctl -u telegram-bot -f` (Ctrl+C leaves the log) and send
+the bot `/help` in Telegram.
+
+**6. The app.** On the Pi, set up Tailscale (on the Pi:
+`curl -fsSL https://tailscale.com/install.sh | sh`, then `sudo tailscale up` and open the
+link it prints to sign in, then `sudo tailscale serve --bg 8765`). Then on both computers,
+open the Pi's address (`https://briefing-pi.<your-tailnet>.ts.net`) in Edge, install the
+app, turn notifications on, and use the link helper (Settings → Open links). Uninstall the
+old `localhost` app.
+
+**Updating later:** after changing the code on the laptop and pushing it to GitHub,
+on the Pi: `cd telegram-bot && git fetch && git reset --hard origin/main && sudo systemctl restart telegram-bot`
+(run `bash scripts/pi-install.sh` instead of the restart if `requirements.txt` changed). This
+replaces the Pi's copy of the code with GitHub's; your private files aren't touched.
 
 ## Kept off GitHub
 
